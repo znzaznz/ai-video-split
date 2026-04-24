@@ -1,0 +1,18 @@
+---
+description: Clean old artifacts before every exe build
+alwaysApply: true
+---
+
+# EXE Build: Always Clean Old Artifacts First
+
+When producing a Windows executable, always generate a fresh build and remove older outputs first.
+
+- Before packaging, delete prior build artifacts for the same app (for example: `build/`, `dist/`, and old `.exe` outputs related to the app).
+- Do not reuse previously generated executables.
+- After build, make sure only the newly generated executable is used for verification and delivery.
+- If a user reports behavior mismatch after code edits, first suspect stale exe artifacts and rebuild from a clean state.
+
+Preferred workflow:
+1. Remove old packaging outputs for this app.
+2. Run packaging command to produce a new exe.
+3. Verify by launching the newly generated exe.
