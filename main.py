@@ -42,6 +42,17 @@ def get_subprocess_window_kwargs() -> dict[str, Any]:
     return {"creationflags": subprocess.CREATE_NO_WINDOW}
 
 
+MANIFEST_NAME = "task_manifest.json"
+
+
+def write_task_manifest(output_dir: Path, payload: dict[str, Any]) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / MANIFEST_NAME
+    data = dict(payload)
+    data["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def sanitize_name(name: str) -> str:
     cleaned = re.sub(r"[^\w\-\.]+", "_", name.strip())
     cleaned = cleaned.strip("._")
@@ -316,6 +327,126 @@ def save_done_urls(checkpoint_path: Path, done_urls: set[str]) -> None:
     )
 
 
+def find_merged_source_video(item_out: Path) -> Path | None:
+    """Best-effort: merged B站下载产物（source.*）。"""
+    for ext in (".mp4", ".mkv", ".webm", ".m4v"):
+        p = item_out / f"source{ext}"
+        if p.is_file() and p.stat().st_size > 0:
+            return p
+    for p in sorted(item_out.glob("source.*")):
+        if p.is_file() and p.suffix.lower() in {".mp4", ".mkv", ".webm", ".m4v"}:
+            return p
+    return None
+
+
+def extract_wav_for_asr(video: Path, out_wav: Path) -> None:
+    """从本地视频抽取 16k mono wav（供上传识别），失败抛错而非 sys.exit。"""
+    out_wav.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(video),
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-c:a",
+        "pcm_s16le",
+        str(out_wav),
+    ]
+    try:
+        subprocess.run(
+            cmd,
+            check=True,
+            capture_output=True,
+            text=True,
+            **get_subprocess_window_kwargs(),
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError("未找到 ffmpeg，请安装并加入 PATH。") from exc
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or "") + "\n" + (exc.stdout or "")
+        raise RuntimeError(f"从视频提取 wav 失败：{detail.strip()}") from exc
+    if not out_wav.exists() or out_wav.stat().st_size <= 0:
+        raise RuntimeError("从视频提取 wav 完成但输出文件无效。")
+
+
+def _yt_dlp_popen_communicate(
+    proc: subprocess.Popen,
+    cancel_event: threading.Event | None,
+    pause_event: threading.Event | None,
+) -> None:
+    while True:
+        if cancel_event and cancel_event.is_set():
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                proc.kill()
+            raise RuntimeError("任务已取消（下载阶段）。")
+        while pause_event and pause_event.is_set():
+            if cancel_event and cancel_event.is_set():
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    proc.kill()
+                raise RuntimeError("任务已取消（下载阶段）。")
+            time.sleep(0.2)
+        try:
+            out, err = proc.communicate(timeout=0.5)
+            break
+        except subprocess.TimeoutExpired:
+            continue
+    if proc.returncode != 0:
+        detail = (out or "") + "\n" + (err or "")
+        raise RuntimeError(detail.strip() or "yt-dlp 失败")
+
+
+def download_bilibili_source_video(
+    url: str,
+    item_out: Path,
+    cancel_event: threading.Event | None = None,
+    pause_event: threading.Event | None = None,
+) -> Path:
+    """
+    下载 B 站合并视频（供切片 + 本地抽 wav），输出到任务目录 source.<ext>。
+    """
+    item_out.mkdir(parents=True, exist_ok=True)
+    out_template = str(item_out / "source.%(ext)s")
+    cmd = [
+        "yt-dlp",
+        "-f",
+        "bv*+ba/bestvideo+bestaudio/best",
+        "--merge-output-format",
+        "mp4",
+        "--no-playlist",
+        "--no-warnings",
+        "--newline",
+        "-o",
+        out_template,
+        url,
+    ]
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            **get_subprocess_window_kwargs(),
+        )
+        _yt_dlp_popen_communicate(proc, cancel_event, pause_event)
+    except FileNotFoundError:
+        raise RuntimeError("未找到 yt-dlp，请先安装：python -m pip install yt-dlp") from None
+
+    video_path = find_merged_source_video(item_out)
+    if not video_path:
+        raise RuntimeError("B站视频下载完成但未找到 source 视频文件。")
+    return video_path
+
+
 def download_bilibili_audio(
     url: str,
     out_wav: Path,
@@ -479,6 +610,16 @@ def run_local(
             cancel_event=cancel_event,
             pause_event=pause_event,
         )
+        write_task_manifest(
+            item_out,
+            {
+                "task_name": name,
+                "mode": "local",
+                "local_video": str(video),
+                "result_json": str((item_out / "result.json").resolve()),
+                "result_txt": str((item_out / "result.txt").resolve()),
+            },
+        )
         total_cost += cost["estimated_cost_cny"]
         total_seconds += cost["billed_seconds"]
         processed_count += 1
@@ -555,15 +696,33 @@ def run_url(
                 item_out = out_root / sanitize_name(f"{display_name}_{sub_idx:02d}")
                 task_key = item_out.name
                 local_wav = url_tmp / f"{task_key}.wav"
+                local_video_path: Path | None = find_merged_source_video(item_out)
                 try:
-                    if local_wav.exists() and local_wav.stat().st_size > 0:
-                        print(f"[{task_key}] 复用已缓存音频：{local_wav}")
-                    else:
-                        print(f"[{task_key}] 检测到 B 站链接，先下载媒体并转音频：{entry_url}")
-                        download_bilibili_audio(
-                            entry_url, local_wav, cancel_event=cancel_event, pause_event=pause_event
+                    wav_ok = local_wav.exists() and local_wav.stat().st_size > 0
+                    if wav_ok and local_video_path:
+                        print(f"[{task_key}] 复用已缓存音视频：wav={local_wav} video={local_video_path}")
+                    elif local_video_path and not wav_ok:
+                        print(f"[{task_key}] 复用已下载视频并提取音频：{local_video_path}")
+                        extract_wav_for_asr(local_video_path, local_wav)
+                        print(f"[{task_key}] 已提取音频：{local_wav}")
+                    elif wav_ok and not local_video_path:
+                        print(
+                            f"[{task_key}] 仅有历史 wav、缺少切片用视频，重新下载视频：{entry_url}"
                         )
-                        print(f"[{task_key}] 已下载音频：{local_wav}")
+                        local_video_path = download_bilibili_source_video(
+                            entry_url, item_out, cancel_event=cancel_event, pause_event=pause_event
+                        )
+                        print(f"[{task_key}] 已下载视频：{local_video_path}")
+                        extract_wav_for_asr(local_video_path, local_wav)
+                        print(f"[{task_key}] 已同步提取音频：{local_wav}")
+                    else:
+                        print(f"[{task_key}] 检测到 B 站链接，先下载视频并转音频：{entry_url}")
+                        local_video_path = download_bilibili_source_video(
+                            entry_url, item_out, cancel_event=cancel_event, pause_event=pause_event
+                        )
+                        print(f"[{task_key}] 已下载视频：{local_video_path}")
+                        extract_wav_for_asr(local_video_path, local_wav)
+                        print(f"[{task_key}] 已提取音频：{local_wav}")
                     oss_url = upload_to_dashscope_tmp(args.api_key, local_wav)
                     print(f"[{task_key}] 已上传临时存储: {oss_url}")
                     cost = process_single_source(
@@ -576,6 +735,18 @@ def run_url(
                         cancel_event=cancel_event,
                         pause_event=pause_event,
                     )
+                    write_task_manifest(
+                        item_out,
+                        {
+                            "task_name": task_key,
+                            "mode": "url",
+                            "source_url": entry_url,
+                            "local_video": str(local_video_path.resolve()) if local_video_path else "",
+                            "local_audio": str(local_wav.resolve()),
+                            "result_json": str((item_out / "result.json").resolve()),
+                            "result_txt": str((item_out / "result.txt").resolve()),
+                        },
+                    )
                 except Exception as exc:
                     print(f"[{task_key}] 媒体下载/转码失败，回退直链识别：{exc}")
                     cost = process_single_source(
@@ -587,6 +758,18 @@ def run_url(
                         oss_resolve=False,
                         cancel_event=cancel_event,
                         pause_event=pause_event,
+                    )
+                    write_task_manifest(
+                        item_out,
+                        {
+                            "task_name": task_key,
+                            "mode": "url",
+                            "source_url": entry_url,
+                            "local_video": "",
+                            "local_audio": "",
+                            "result_json": str((item_out / "result.json").resolve()),
+                            "result_txt": str((item_out / "result.txt").resolve()),
+                        },
                     )
                 total_cost += cost["estimated_cost_cny"]
                 total_seconds += cost["billed_seconds"]
@@ -610,6 +793,18 @@ def run_url(
                 oss_resolve=False,
                 cancel_event=cancel_event,
                 pause_event=pause_event,
+            )
+            write_task_manifest(
+                item_out,
+                {
+                    "task_name": name,
+                    "mode": "url",
+                    "source_url": media_url,
+                    "local_video": "",
+                    "local_audio": "",
+                    "result_json": str((item_out / "result.json").resolve()),
+                    "result_txt": str((item_out / "result.txt").resolve()),
+                },
             )
             total_cost += cost["estimated_cost_cny"]
             total_seconds += cost["billed_seconds"]

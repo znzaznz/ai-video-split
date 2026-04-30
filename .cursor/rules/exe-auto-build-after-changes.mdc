@@ -1,0 +1,10 @@
+---
+description: Auto-run PyInstaller after bundled code changes in this repo
+alwaysApply: true
+---
+
+# 改完代码默认打 exe（video-to-word）
+
+在本仓库中，若本轮修改了会打进 **`视频转文字.exe`** 的源码（例如 `gui.py`、`main.py`、`auto_clip_from_transcript.py` 及被入口脚本打包进 onefile 的相关模块），**在收尾前默认执行** 根目录 `build_exe.ps1`（已内含清理旧 `build/`、`dist/`、旧 exe），**无需用户再说「打包」**。
+
+若用户在该轮消息中明确说本次不要打 exe，可跳过。若打包失败且提示文件占用，提醒用户先关闭正在运行的 exe 后重试。
