@@ -9,6 +9,7 @@ import contextlib
 import json
 import os
 import queue
+import shutil
 import sys
 import threading
 import tkinter as tk
@@ -17,6 +18,14 @@ from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
 
 import main as pipeline_main
 import auto_clip_from_transcript as clipper
+import transcript_correct as tc
+from slice_logic import (
+    DEFAULT_SLICE_LOGIC,
+    SLICE_LOGIC_MODES,
+    get_logic_default_text,
+    get_logic_how,
+    get_logic_summary,
+)
 
 
 def load_env_values(env_path: Path) -> dict[str, str]:
@@ -136,7 +145,7 @@ def find_env_values() -> dict[str, str]:
 class App:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("Video To Word")
+        self.root.title("视频切片机 — 转写 · 智能切片")
 
         self.log_queue: queue.Queue[str] = queue.Queue()
         self.worker: threading.Thread | None = None
@@ -155,11 +164,14 @@ class App:
         )
         self.poll_var = tk.StringVar(value=env.get("POLL_INTERVAL", "2"))
         self.timeout_var = tk.StringVar(value=env.get("TIMEOUT", "900"))
+        self.keywords_var = tk.StringVar(value=env.get("TRANSCRIPT_KEYWORDS", ""))
+        self.llm_correct_var = tk.BooleanVar(value=env.get("TRANSCRIPT_LLM_CORRECT", "1") != "0")
 
         self.local_files: list[str] = []
         self.parse_tasks: list[dict[str, str]] = []
         self.clip_worker: threading.Thread | None = None
         self.clip_cancel_event = threading.Event()
+        self.parse_log_queue: queue.Queue[str] = queue.Queue()
 
         if not self.api_key_var.get().startswith("sk-"):
             key = simpledialog.askstring(
@@ -229,19 +241,27 @@ class App:
         ttk.Label(frm, text="超时(s):").grid(row=2, column=2, sticky="e")
         ttk.Entry(frm, textvariable=self.timeout_var, width=10).grid(row=2, column=3, sticky="w")
 
+        ttk.Label(frm, text="本期关键词:").grid(row=3, column=0, sticky="w", pady=(4, 0))
+        ttk.Entry(frm, textvariable=self.keywords_var, width=70).grid(
+            row=3, column=1, columnspan=3, sticky="ew", pady=(4, 0)
+        )
+        ttk.Checkbutton(frm, text="转写后 AI 纠错", variable=self.llm_correct_var).grid(
+            row=3, column=4, sticky="w", pady=(4, 0)
+        )
+
         self.local_frame = ttk.LabelFrame(frm, text="本地视频输入")
-        self.local_frame.grid(row=3, column=0, columnspan=5, sticky="nsew", pady=(8, 6))
+        self.local_frame.grid(row=4, column=0, columnspan=5, sticky="nsew", pady=(8, 6))
         ttk.Button(self.local_frame, text="选择一个或多个视频", command=self._pick_local_files).pack(anchor="w", pady=4)
         self.local_list = tk.Listbox(self.local_frame, height=6)
         self.local_list.pack(fill=tk.BOTH, expand=True)
 
         self.url_frame = ttk.LabelFrame(frm, text="链接输入（每行一个URL）")
-        self.url_frame.grid(row=4, column=0, columnspan=5, sticky="nsew", pady=(8, 6))
+        self.url_frame.grid(row=5, column=0, columnspan=5, sticky="nsew", pady=(8, 6))
         self.url_text = scrolledtext.ScrolledText(self.url_frame, height=7)
         self.url_text.pack(fill=tk.BOTH, expand=True)
 
         btns = ttk.Frame(frm)
-        btns.grid(row=5, column=0, columnspan=5, sticky="ew", pady=(6, 6))
+        btns.grid(row=6, column=0, columnspan=5, sticky="ew", pady=(6, 6))
         self.run_btn = ttk.Button(btns, text="开始执行", command=self._run)
         self.run_btn.pack(side=tk.LEFT)
         self.pause_btn = ttk.Button(btns, text="暂停", command=self._toggle_pause, state=tk.DISABLED)
@@ -251,16 +271,16 @@ class App:
         ttk.Button(btns, text="清空日志", command=self._clear_log).pack(side=tk.LEFT, padx=(8, 0))
 
         log_frame = ttk.LabelFrame(frm, text="运行日志")
-        log_frame.grid(row=6, column=0, columnspan=5, sticky="nsew", pady=(6, 0))
+        log_frame.grid(row=7, column=0, columnspan=5, sticky="nsew", pady=(6, 0))
         self.log = scrolledtext.ScrolledText(log_frame, height=14)
         self.log.pack(fill=tk.BOTH, expand=True)
 
         frm.columnconfigure(1, weight=1)
         frm.columnconfigure(2, weight=1)
         frm.columnconfigure(3, weight=1)
-        frm.rowconfigure(3, weight=1)
         frm.rowconfigure(4, weight=1)
-        frm.rowconfigure(6, weight=2)
+        frm.rowconfigure(5, weight=1)
+        frm.rowconfigure(7, weight=2)
 
         self._refresh_mode()
 
@@ -278,10 +298,12 @@ class App:
         row_btns.pack(fill=tk.X, pady=(4, 4))
         ttk.Button(row_btns, text="刷新列表", command=self.refresh_parse_tasks).pack(side=tk.LEFT)
         ttk.Button(row_btns, text="打开任务目录", command=self._open_selected_task_dir).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(row_btns, text="删除任务", command=self._delete_selected_tasks).pack(side=tk.LEFT, padx=(8, 0))
 
         self.parse_list = tk.Listbox(left, height=18, exportselection=False, selectmode=tk.EXTENDED)
         self.parse_list.pack(fill=tk.BOTH, expand=True)
         self.parse_list.bind("<<ListboxSelect>>", self._on_parse_select)
+        self.parse_list.bind("<Delete>", lambda _e: self._delete_selected_tasks())
 
         ttk.Label(right, text="解析文件表", font=("TkDefaultFont", 10, "bold")).pack(anchor="w")
         parse_table_wrap = ttk.Frame(right)
@@ -295,56 +317,31 @@ class App:
         self.parse_selected_table.configure(yscrollcommand=self.parse_selected_scroll.set)
         self.parse_selected_table.insert(tk.END, "（未选择任务）")
 
-        ttk.Label(right, text="选段策略", font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(10, 0))
-        tmpl_row = ttk.Frame(right)
-        tmpl_row.pack(fill=tk.X, pady=(4, 0))
-        self.prompt_templates = {
-            "默认爆点": (
-                "优先找：冲突、反转、情绪高点、信息密度高、能独立看懂的片段；"
-                "优先完整观点或完整事件单元，避免掐头去尾；"
-                "优先有明确起承转合（铺垫→爆点→结论）的段落；"
-                "优先金句、结论句、态度鲜明句、争议点；"
-                "尽量避开寒暄、口头禅、重复表达、空洞过渡。"
-            ),
-            "搞笑吐槽": "优先找：包袱、夸张吐槽、节奏密集的互怼、反转笑点。",
-            "吃瓜爆料": "优先找：关键人物/事件点名、爆料细节、冲突升级、结论金句。",
-            "干货教程": "优先找：定义/结论/步骤/举例，信息密度高且能独立看懂的一段。",
-        }
-        self.template_choice = tk.StringVar(value="默认爆点")
-        self.template_combo = ttk.Combobox(
-            tmpl_row,
-            textvariable=self.template_choice,
-            values=list(self.prompt_templates.keys()),
+        ttk.Label(right, text="切片逻辑", font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(10, 0))
+        logic_row = ttk.Frame(right)
+        logic_row.pack(fill=tk.X, pady=(4, 0))
+        self.slice_logic_choice = tk.StringVar(value=DEFAULT_SLICE_LOGIC)
+        self.slice_logic_combo = ttk.Combobox(
+            logic_row,
+            textvariable=self.slice_logic_choice,
+            values=list(SLICE_LOGIC_MODES.keys()),
             state="readonly",
-            width=18,
+            width=28,
         )
-        self.template_combo.pack(side=tk.LEFT)
-        self.template_combo.bind("<<ComboboxSelected>>", lambda _e: self._apply_prompt_template())
+        self.slice_logic_combo.pack(side=tk.LEFT)
+        self.slice_logic_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_slice_logic_change())
 
-        self.strategy_text = scrolledtext.ScrolledText(right, height=10, wrap=tk.WORD)
-        self.strategy_text.pack(fill=tk.BOTH, expand=False, pady=(6, 0))
-        self._apply_prompt_template()
+        self.slice_logic_summary_var = tk.StringVar()
+        ttk.Label(
+            right,
+            textvariable=self.slice_logic_summary_var,
+            wraplength=520,
+            foreground="#555555",
+        ).pack(anchor="w", pady=(6, 0))
 
-        opts = ttk.Frame(right)
-        opts.pack(fill=tk.X, pady=(8, 0))
-        self.clip_max_clips = tk.StringVar(value="6")
-        self.clip_min_sec = tk.StringVar(value="20")
-        self.clip_max_sec = tk.StringVar(value="60")
-        self.clip_chunk_min = tk.StringVar(value="30")
-        self.clip_chunk_retries = tk.StringVar(value="2")
-        self.clip_rule_fallback = tk.BooleanVar(value=False)
-
-        ttk.Label(opts, text="max").grid(row=0, column=0, sticky="w")
-        ttk.Entry(opts, textvariable=self.clip_max_clips, width=6).grid(row=0, column=1, sticky="w", padx=(4, 12))
-        ttk.Label(opts, text="min秒").grid(row=0, column=2, sticky="w")
-        ttk.Entry(opts, textvariable=self.clip_min_sec, width=6).grid(row=0, column=3, sticky="w", padx=(4, 12))
-        ttk.Label(opts, text="max秒").grid(row=0, column=4, sticky="w")
-        ttk.Entry(opts, textvariable=self.clip_max_sec, width=6).grid(row=0, column=5, sticky="w", padx=(4, 12))
-        ttk.Label(opts, text="分段(分)").grid(row=0, column=6, sticky="w")
-        ttk.Entry(opts, textvariable=self.clip_chunk_min, width=6).grid(row=0, column=7, sticky="w", padx=(4, 12))
-        ttk.Label(opts, text="重试").grid(row=0, column=8, sticky="w")
-        ttk.Entry(opts, textvariable=self.clip_chunk_retries, width=6).grid(row=0, column=9, sticky="w", padx=(4, 12))
-        ttk.Checkbutton(opts, text="失败规则兜底", variable=self.clip_rule_fallback).grid(row=0, column=10, sticky="w", padx=(8, 0))
+        self.slice_logic_text = scrolledtext.ScrolledText(right, height=8, wrap=tk.WORD)
+        self.slice_logic_text.pack(fill=tk.BOTH, expand=False, pady=(6, 0))
+        self._on_slice_logic_change()
 
         clip_btns = ttk.Frame(right)
         clip_btns.pack(fill=tk.X, pady=(8, 0))
@@ -395,8 +392,7 @@ class App:
         self.parse_log.delete("1.0", tk.END)
 
     def _parse_log(self, msg: str) -> None:
-        self.parse_log.insert(tk.END, msg + "\n")
-        self.parse_log.see(tk.END)
+        self.parse_log_queue.put(msg)
 
     def _log(self, msg: str) -> None:
         self.log_queue.put(msg)
@@ -419,6 +415,13 @@ class App:
                 msg = self.log_queue.get_nowait()
                 self.log.insert(tk.END, msg + "\n")
                 self.log.see(tk.END)
+        except queue.Empty:
+            pass
+        try:
+            while True:
+                msg = self.parse_log_queue.get_nowait()
+                self.parse_log.insert(tk.END, msg + "\n")
+                self.parse_log.see(tk.END)
         except queue.Empty:
             pass
         self.root.after(120, self._tick_logs)
@@ -488,6 +491,8 @@ class App:
                 out_dir=Path(self.out_dir_var.get().strip() or "runs"),
                 poll_interval=int(self.poll_var.get().strip() or "2"),
                 timeout=int(self.timeout_var.get().strip() or "900"),
+                user_keywords=self.keywords_var.get().strip(),
+                no_llm_correct=not bool(self.llm_correct_var.get()),
                 mode=mode,
                 videos=items if mode == "local" else None,
                 urls=items if mode == "url" else None,
@@ -543,12 +548,13 @@ class App:
                 continue
             task_dir = m.parent
             title = str(data.get("task_name") or task_dir.name)
+            transcript_json = tc.resolve_transcript_json(task_dir)
             self.parse_tasks.append(
                 {
                     "title": title,
                     "dir": str(task_dir),
                     "manifest": str(m),
-                    "result_json": str(data.get("result_json") or (task_dir / "result.json")),
+                    "result_json": str(transcript_json),
                     "local_video": str(data.get("local_video") or ""),
                     "local_audio": str(data.get("local_audio") or ""),
                     "source_url": str(data.get("source_url") or ""),
@@ -594,11 +600,86 @@ class App:
         except Exception:
             messagebox.showerror("错误", f"无法打开目录：{d}")
 
-    def _apply_prompt_template(self) -> None:
-        name = self.template_choice.get()
-        body = self.prompt_templates.get(name, self.prompt_templates["默认爆点"])
-        self.strategy_text.delete("1.0", tk.END)
-        self.strategy_text.insert(tk.END, body)
+    def _delete_selected_tasks(self) -> None:
+        if self.clip_worker and self.clip_worker.is_alive():
+            messagebox.showinfo("正在切片", "切片进行中，请完成或取消后再删除。")
+            return
+        if self.worker and self.worker.is_alive():
+            messagebox.showinfo("正在转写", "转写进行中，请完成或取消后再删除。")
+            return
+
+        idxs = self.parse_list.curselection()
+        if not idxs:
+            messagebox.showinfo("提示", "请先在左侧选择要删除的任务（可多选）。")
+            return
+
+        selected = [self.parse_tasks[int(i)] for i in idxs]
+        out_root = Path(self.out_dir_var.get().strip() or "runs").resolve()
+
+        lines: list[str] = []
+        for t in selected[:8]:
+            lines.append(f"· {t.get('title') or Path(t['dir']).name}")
+        if len(selected) > 8:
+            lines.append(f"· …共 {len(selected)} 项")
+        preview = "\n".join(lines)
+
+        if not messagebox.askyesno(
+            "确认删除",
+            f"将永久删除以下任务目录（含转写、切片等全部文件），无法恢复：\n\n{preview}\n\n确定删除？",
+            icon="warning",
+        ):
+            return
+
+        ok, failed = 0, 0
+        errors: list[str] = []
+        for t in selected:
+            task_dir = Path(t["dir"]).resolve()
+            try:
+                task_dir.relative_to(out_root)
+            except ValueError:
+                failed += 1
+                errors.append(f"{task_dir.name}：不在输出目录内，已跳过")
+                continue
+            if task_dir.name.startswith("_") and task_dir.parent == out_root:
+                failed += 1
+                errors.append(f"{task_dir.name}：系统目录，已跳过")
+                continue
+            if not task_dir.is_dir():
+                failed += 1
+                errors.append(f"{task_dir.name}：目录不存在")
+                continue
+            try:
+                shutil.rmtree(task_dir)
+                ok += 1
+                audio_tmp = out_root / "_audio_tmp" / f"{task_dir.name}.wav"
+                if audio_tmp.is_file():
+                    try:
+                        audio_tmp.unlink()
+                    except OSError:
+                        pass
+            except OSError as exc:
+                failed += 1
+                errors.append(f"{task_dir.name}：{exc}")
+
+        self.refresh_parse_tasks()
+        self.parse_selected_table.delete(0, tk.END)
+        self.parse_selected_table.insert(tk.END, "（未选择任务）")
+
+        if failed == 0:
+            messagebox.showinfo("删除完成", f"已删除 {ok} 个任务。")
+        else:
+            detail = "\n".join(errors[:6])
+            if len(errors) > 6:
+                detail += f"\n…另有 {len(errors) - 6} 项"
+            messagebox.showwarning("删除结果", f"成功 {ok} 个，失败 {failed} 个。\n\n{detail}")
+
+    def _on_slice_logic_change(self) -> None:
+        key = self.slice_logic_choice.get().strip() or DEFAULT_SLICE_LOGIC
+        if key not in SLICE_LOGIC_MODES:
+            key = DEFAULT_SLICE_LOGIC
+        self.slice_logic_summary_var.set(get_logic_summary(key))
+        self.slice_logic_text.delete("1.0", tk.END)
+        self.slice_logic_text.insert(tk.END, get_logic_default_text(key))
 
     def _cancel_clip(self) -> None:
         self.clip_cancel_event.set()
@@ -623,17 +704,13 @@ class App:
             messagebox.showerror("错误", "需要有效的 sk- API Key。")
             return
 
-        try:
-            max_clips = int(self.clip_max_clips.get().strip())
-            min_sec = int(self.clip_min_sec.get().strip())
-            max_sec = int(self.clip_max_sec.get().strip())
-            chunk_min = int(self.clip_chunk_min.get().strip())
-            chunk_retries = int(self.clip_chunk_retries.get().strip())
-        except Exception:
-            messagebox.showerror("错误", "切片参数必须是整数。")
+        logic_key = self.slice_logic_choice.get().strip() or DEFAULT_SLICE_LOGIC
+        slice_goal = self.slice_logic_text.get("1.0", tk.END).strip()
+        if not slice_goal:
+            messagebox.showinfo("提示", "请填写切片逻辑说明。")
             return
 
-        strategy = self.strategy_text.get("1.0", tk.END).strip()
+        slice_logic_how = get_logic_how(logic_key)
 
         self.clip_cancel_event.clear()
         self.clip_run_btn.configure(state=tk.DISABLED)
@@ -665,14 +742,8 @@ class App:
                             transcript_json=transcript,
                             out_dir=out_dir,
                             api_key=api_key,
-                            max_clips=max_clips,
-                            min_sec=min_sec,
-                            max_sec=max_sec,
-                            chunk_minutes=chunk_min,
-                            chunk_retries=chunk_retries,
-                            rule_fallback_after_retries=bool(self.clip_rule_fallback.get()),
-                            strategy_instructions=strategy or None,
-                            custom_user_prompt=None,
+                            slice_goal=slice_goal,
+                            slice_logic_how=slice_logic_how,
                         )
                         total_cost += float(clip_cost)
                         ok_count += 1

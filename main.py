@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -34,6 +35,7 @@ from video_to_text_paraformer import (
     submit_asr,
     write_outputs,
 )
+import transcript_correct as tc
 
 
 def get_subprocess_window_kwargs() -> dict[str, Any]:
@@ -43,6 +45,30 @@ def get_subprocess_window_kwargs() -> dict[str, Any]:
 
 
 MANIFEST_NAME = "task_manifest.json"
+
+
+def correction_kwargs_from_args(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "user_keywords": str(getattr(args, "user_keywords", "") or ""),
+        "enable_llm_correct": not bool(getattr(args, "no_llm_correct", False)),
+    }
+
+
+def manifest_transcript_fields(item_out: Path) -> dict[str, str]:
+    return {"result_json": str((item_out / "result.json").resolve())}
+
+
+def copy_local_video_to_task_dir(video: Path, item_out: Path) -> Path:
+    """Copy local video into task dir as source.<ext> for self-contained clipping."""
+    item_out.mkdir(parents=True, exist_ok=True)
+    ext = video.suffix.lower() if video.suffix else ".mp4"
+    if ext not in {".mp4", ".mkv", ".webm", ".m4v", ".mov"}:
+        ext = ".mp4"
+    dest = item_out / f"source{ext}"
+    if dest.resolve() != video.resolve():
+        shutil.copy2(video, dest)
+        print(f"[{item_out.name}] 已复制视频到任务目录: {dest}")
+    return dest
 
 
 def write_task_manifest(output_dir: Path, payload: dict[str, Any]) -> None:
@@ -327,6 +353,76 @@ def save_done_urls(checkpoint_path: Path, done_urls: set[str]) -> None:
     )
 
 
+def local_video_fingerprint(video: Path) -> str:
+    """Stable id for same local file (path + size + mtime)."""
+    p = video.resolve()
+    st = p.stat()
+    return f"{p}|{st.st_size}|{int(st.st_mtime)}"
+
+
+def load_done_local_keys(checkpoint_path: Path) -> set[str]:
+    if not checkpoint_path.exists():
+        return set()
+    try:
+        data = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        items = data.get("done_local_keys")
+        if isinstance(items, list):
+            return {str(x).strip() for x in items if str(x).strip()}
+    except Exception:
+        pass
+    return set()
+
+
+def save_done_local_keys(checkpoint_path: Path, keys: set[str]) -> None:
+    checkpoint_path.write_text(
+        json.dumps({"done_local_keys": sorted(keys)}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def is_valid_result_json(path: Path) -> bool:
+    if not path.is_file() or path.stat().st_size <= 2:
+        return False
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return isinstance(data, list) and len(data) > 0
+    except Exception:
+        return False
+
+
+def find_completed_task_for_local_video(out_root: Path, video: Path) -> Path | None:
+    """Find an existing task dir that already transcribed this exact local file."""
+    fp = local_video_fingerprint(video)
+    resolved = str(video.resolve())
+
+    for manifest in out_root.rglob(MANIFEST_NAME):
+        if "_audio_tmp" in manifest.parts or "_url_tmp" in manifest.parts:
+            continue
+        task_dir = manifest.parent
+        result_json = task_dir / "result.json"
+        if not is_valid_result_json(result_json):
+            continue
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if str(data.get("mode") or "") == "url":
+            continue
+        if str(data.get("source_fingerprint") or "") == fp:
+            return task_dir
+        for key in ("local_video", "source_video", "source_path"):
+            prev = str(data.get(key) or "").strip()
+            if not prev:
+                continue
+            try:
+                if Path(prev).resolve() == video.resolve():
+                    return task_dir
+            except Exception:
+                if prev == resolved:
+                    return task_dir
+    return None
+
+
 def find_merged_source_video(item_out: Path) -> Path | None:
     """Best-effort: merged B站下载产物（source.*）。"""
     for ext in (".mp4", ".mkv", ".webm", ".m4v"):
@@ -519,8 +615,21 @@ def process_single_source(
     oss_resolve: bool = False,
     cancel_event: threading.Event | None = None,
     pause_event: threading.Event | None = None,
+    task_title: str = "",
+    user_keywords: str = "",
+    enable_llm_correct: bool = True,
 ) -> dict[str, float]:
-    task_id = submit_asr(api_key, media_url, oss_resolve=oss_resolve)
+    vocabulary_id: str | None = None
+    try:
+        vocabulary_id = tc.prepare_asr_vocabulary(
+            api_key, output_dir, task_title=task_title or output_dir.name, user_keywords=user_keywords
+        )
+    except Exception as exc:
+        print(f"[{output_dir.name}] 热词准备失败（继续转写）：{exc}")
+
+    task_id = submit_asr(
+        api_key, media_url, oss_resolve=oss_resolve, vocabulary_id=vocabulary_id
+    )
     print(f"[{output_dir.name}] 任务已提交: {task_id}")
     task_result = poll_task(
         api_key,
@@ -546,7 +655,21 @@ def process_single_source(
     if not sentences:
         raise RuntimeError(f"[{output_dir.name}] 未解析到句级时间戳。")
 
-    write_outputs(sentences, output_dir)
+    try:
+        _, llm_cost = tc.run_post_asr_correction(
+            api_key=api_key,
+            output_dir=output_dir,
+            sentences=sentences,
+            task_title=task_title or output_dir.name,
+            user_keywords=user_keywords,
+            enable_llm=enable_llm_correct,
+        )
+        if llm_cost > 0:
+            print(f"[{output_dir.name}] 纠错 LLM 费用约 ¥{llm_cost:.6f}")
+    except Exception as exc:
+        print(f"[{output_dir.name}] 转写后纠错失败，写入未纠错稿：{exc}")
+        write_outputs(sentences, output_dir)
+
     cost = estimate_cost_cny(task_result, sentences, price_per_hour=DEFAULT_PRICE_PER_HOUR)
     print(f"[{output_dir.name}] 完成，共 {len(sentences)} 句")
     print("")
@@ -567,10 +690,15 @@ def run_local(
     out_root.mkdir(parents=True, exist_ok=True)
     audio_tmp = out_root / "_audio_tmp"
     audio_tmp.mkdir(parents=True, exist_ok=True)
+    local_checkpoint = out_root / "_local_done_checkpoint.json"
+    done_local_keys = load_done_local_keys(local_checkpoint)
+    batch_keys: set[str] = set()
 
     total_cost = 0.0
     total_seconds = 0.0
     processed_count = 0
+    skipped_count = 0
+    ck = correction_kwargs_from_args(args)
 
     for video_str in args.videos:
         if cancel_event and cancel_event.is_set():
@@ -591,15 +719,60 @@ def run_local(
             print(f"跳过（不存在）：{video}", file=sys.stderr)
             continue
 
+        fp = local_video_fingerprint(video)
+        if fp in batch_keys:
+            print(f"[skip] 本批重复，跳过：{video}")
+            skipped_count += 1
+            continue
+        batch_keys.add(fp)
+
+        if fp in done_local_keys:
+            print(f"[skip] 已完成（记录），跳过：{video}")
+            skipped_count += 1
+            continue
+
+        existing = find_completed_task_for_local_video(out_root, video)
+        if existing is not None:
+            print(f"[skip] 已完成，跳过：{video}")
+            print(f"       已有任务：{existing}")
+            done_local_keys.add(fp)
+            save_done_local_keys(local_checkpoint, done_local_keys)
+            skipped_count += 1
+            continue
+
         name = sanitize_name(video.stem)
+        item_out = out_root / name
+        if is_valid_result_json(item_out / "result.json"):
+            manifest_path = item_out / MANIFEST_NAME
+            same_file = True
+            if manifest_path.is_file():
+                try:
+                    data = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    if str(data.get("source_fingerprint") or "") not in ("", fp):
+                        prev_lv = str(data.get("local_video") or "")
+                        if prev_lv:
+                            try:
+                                same_file = Path(prev_lv).resolve() == video.resolve()
+                            except Exception:
+                                same_file = False
+                except Exception:
+                    pass
+            if same_file:
+                print(f"[skip] 已完成，跳过：{video}")
+                print(f"       任务目录：{item_out}")
+                done_local_keys.add(fp)
+                save_done_local_keys(local_checkpoint, done_local_keys)
+                skipped_count += 1
+                continue
+
+        source_video = copy_local_video_to_task_dir(video, item_out)
         local_audio = audio_tmp / f"{name}.wav"
-        extract_audio(video, local_audio)
+        extract_audio(source_video, local_audio)
         print(f"[{name}] 已提取音频: {local_audio}")
 
         oss_url = upload_to_dashscope_tmp(args.api_key, local_audio)
         print(f"[{name}] 已上传临时存储: {oss_url}")
 
-        item_out = out_root / name
         cost = process_single_source(
             api_key=args.api_key,
             media_url=oss_url,
@@ -609,28 +782,36 @@ def run_local(
             oss_resolve=True,
             cancel_event=cancel_event,
             pause_event=pause_event,
+            task_title=name,
+            **ck,
         )
         write_task_manifest(
             item_out,
             {
                 "task_name": name,
                 "mode": "local",
-                "local_video": str(video),
-                "result_json": str((item_out / "result.json").resolve()),
-                "result_txt": str((item_out / "result.txt").resolve()),
+                "local_video": str(source_video.resolve()),
+                "source_fingerprint": fp,
+                "user_keywords": ck.get("user_keywords", ""),
+                **manifest_transcript_fields(item_out),
             },
         )
+        done_local_keys.add(fp)
+        save_done_local_keys(local_checkpoint, done_local_keys)
         total_cost += cost["estimated_cost_cny"]
         total_seconds += cost["billed_seconds"]
         processed_count += 1
 
-    if processed_count > 1:
+    if processed_count > 0 or skipped_count > 0:
         print("")
-        print(
-            f"[批量汇总] 共 {processed_count} 个视频，"
-            f"总时长 {total_seconds:.2f}s，"
-            f"总费用约 ¥{total_cost:.6f}"
-        )
+        if processed_count > 0:
+            print(
+                f"[批量汇总] 新处理 {processed_count} 个，"
+                f"总时长 {total_seconds:.2f}s，"
+                f"费用约 ¥{total_cost:.6f}"
+            )
+        if skipped_count > 0:
+            print(f"[批量汇总] 跳过 {skipped_count} 个（路径相同且已转写）。")
         print("")
     return {
         "processed_count": float(processed_count),
@@ -654,6 +835,7 @@ def run_url(
     total_cost = 0.0
     total_seconds = 0.0
     processed_count = 0
+    ck = correction_kwargs_from_args(args)
 
     for idx, media_url in enumerate(args.urls, start=1):
         if cancel_event and cancel_event.is_set():
@@ -734,6 +916,8 @@ def run_url(
                         oss_resolve=True,
                         cancel_event=cancel_event,
                         pause_event=pause_event,
+                        task_title=display_name,
+                        **ck,
                     )
                     write_task_manifest(
                         item_out,
@@ -743,8 +927,8 @@ def run_url(
                             "source_url": entry_url,
                             "local_video": str(local_video_path.resolve()) if local_video_path else "",
                             "local_audio": str(local_wav.resolve()),
-                            "result_json": str((item_out / "result.json").resolve()),
-                            "result_txt": str((item_out / "result.txt").resolve()),
+                            "user_keywords": ck.get("user_keywords", ""),
+                            **manifest_transcript_fields(item_out),
                         },
                     )
                 except Exception as exc:
@@ -758,6 +942,8 @@ def run_url(
                         oss_resolve=False,
                         cancel_event=cancel_event,
                         pause_event=pause_event,
+                        task_title=display_name,
+                        **ck,
                     )
                     write_task_manifest(
                         item_out,
@@ -767,8 +953,8 @@ def run_url(
                             "source_url": entry_url,
                             "local_video": "",
                             "local_audio": "",
-                            "result_json": str((item_out / "result.json").resolve()),
-                            "result_txt": str((item_out / "result.txt").resolve()),
+                            "user_keywords": ck.get("user_keywords", ""),
+                            **manifest_transcript_fields(item_out),
                         },
                     )
                 total_cost += cost["estimated_cost_cny"]
@@ -793,6 +979,8 @@ def run_url(
                 oss_resolve=False,
                 cancel_event=cancel_event,
                 pause_event=pause_event,
+                task_title=name,
+                **ck,
             )
             write_task_manifest(
                 item_out,
@@ -802,8 +990,8 @@ def run_url(
                     "source_url": media_url,
                     "local_video": "",
                     "local_audio": "",
-                    "result_json": str((item_out / "result.json").resolve()),
-                    "result_txt": str((item_out / "result.txt").resolve()),
+                    "user_keywords": ck.get("user_keywords", ""),
+                    **manifest_transcript_fields(item_out),
                 },
             )
             total_cost += cost["estimated_cost_cny"]
@@ -833,6 +1021,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--out-dir", type=Path, default=Path("runs"), help="总输出目录")
     parser.add_argument("--poll-interval", type=int, default=2, help="任务轮询间隔（秒）")
     parser.add_argument("--timeout", type=int, default=900, help="单任务超时（秒）")
+    parser.add_argument(
+        "--keywords",
+        default="",
+        help="本期关键词（逗号分隔），用于热词与转写纠错词表",
+    )
+    parser.add_argument(
+        "--no-llm-correct",
+        action="store_true",
+        help="转写后不使用 LLM 纠错（仍会做规则纠错）",
+    )
 
     subparsers = parser.add_subparsers(dest="mode", required=True)
 

@@ -23,7 +23,18 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from slice_logic import (
+    DEFAULT_CHUNK_MINUTES,
+    DEFAULT_CHUNK_RETRIES,
+    DEFAULT_MAX_SEC,
+    DEFAULT_MIN_SEC,
+    DEFAULT_RULE_FALLBACK,
+    DEFAULT_SLICE_LOGIC,
+    get_logic_how,
+)
+
 # Rough estimate for qwen-plus compatible chat (CNY per 1K tokens). Override via env if needed.
+RULE_FALLBACK_MAX_CLIPS = 12
 DEFAULT_INPUT_CNY_PER_1K = float(__import__("os").environ.get("CLIP_AI_INPUT_CNY_PER_1K", "0.004"))
 DEFAULT_OUTPUT_CNY_PER_1K = float(__import__("os").environ.get("CLIP_AI_OUTPUT_CNY_PER_1K", "0.012"))
 
@@ -49,13 +60,19 @@ def estimate_chat_cost_cny(data: dict[str, Any], prompt_text: str, completion_te
     return (pt / 1000.0) * DEFAULT_INPUT_CNY_PER_1K + (ct / 1000.0) * DEFAULT_OUTPUT_CNY_PER_1K
 
 
-def request_json(url: str, method: str, headers: dict[str, str], body: dict[str, Any] | None = None) -> dict[str, Any]:
+def request_json(
+    url: str,
+    method: str,
+    headers: dict[str, str],
+    body: dict[str, Any] | None = None,
+    timeout: int = 180,
+) -> dict[str, Any]:
     data = None
     if body is not None:
         data = json.dumps(body, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(url=url, method=method, headers=headers, data=data)
     try:
-        with urllib.request.urlopen(req, timeout=90) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             text = resp.read().decode("utf-8")
             return json.loads(text) if text.strip() else {}
     except urllib.error.HTTPError as exc:
@@ -75,6 +92,30 @@ def sanitize_name(name: str) -> str:
     cleaned = re.sub(r"[^\w\-\.\u4e00-\u9fff]+", "_", name.strip())
     cleaned = cleaned.strip("._")
     return cleaned or "clip"
+
+
+def load_glossary_hint(transcript_json: Path) -> str:
+    """Rebuild glossary hint from task title/keywords (no glossary.json on disk)."""
+    try:
+        from transcript_correct import _glossary_hint_block, build_glossary
+    except ImportError:
+        return ""
+
+    task_dir = transcript_json.parent
+    title = task_dir.name
+    user_keywords = ""
+    manifest = task_dir / "task_manifest.json"
+    if manifest.is_file():
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            title = str(data.get("task_name") or title)
+            user_keywords = str(data.get("user_keywords") or "")
+        except Exception:
+            pass
+    hint = _glossary_hint_block(build_glossary(title, user_keywords))
+    if not hint or hint == "（无）":
+        return ""
+    return "转写实体参考（由标题/关键词自动生成，非预置词表）：\n" + hint
 
 
 def load_sentences(path: Path) -> list[dict[str, Any]]:
@@ -122,121 +163,78 @@ def _looks_like_legacy_full_custom_prompt(text: str) -> bool:
     return False
 
 
-def build_fixed_slice_instruction_block(
-    max_clips: int,
-    min_sec: int,
-    max_sec: int,
-) -> str:
-    """Hard constraints shared by every clip job (偏好仅由「选段策略」说明)。"""
+def duration_constraint_text(min_sec: int, max_sec: int) -> str:
+    if max_sec > 0:
+        return f"每段时长 {min_sec}-{max_sec} 秒"
+    return f"每段至少 {min_sec} 秒，不设最长时长上限（按完整主题/观点切，可到数分钟）"
+
+
+def build_technical_constraints_block(min_sec: int, max_sec: int) -> str:
+    dur = duration_constraint_text(min_sec, max_sec)
     return (
-        "你是短视频剪辑策划助手。给定逐句时间戳文本，请挑选最值得剪成短视频的片段。"
-        "输出必须是 JSON，不要 markdown。\n"
-        f"要求:\n1) 最多 {max_clips} 段\n2) 每段时长 {min_sec}-{max_sec} 秒\n"
-        "3) 不重叠\n4) 仅返回数组，每项字段: title,start_ms,end_ms,reason\n"
+        "【技术约束】（必须遵守）\n"
+        f"1) {dur}\n"
+        "2) 片段互不重叠\n"
+        "3) 段数由转写内容与切片目标决定，不设上限，需要几段就输出几段\n"
+        "4) 仅返回一个 JSON 对象，不要 markdown；格式："
+        '{"clips":[{"title":"短标题","start_ms":0,"end_ms":0,"reason":"短说明"}]}\n'
+        "5) title/reason 各不超过 30 字，勿使用英文双引号\n"
     )
 
 
-def build_ai_user_prompt(
-    sentences: list[dict[str, Any]],
-    max_clips: int,
-    min_sec: int,
-    max_sec: int,
-    strategy_instructions: str | None,
-    custom_user_prompt: str | None,
-) -> str:
-    """
-    Compose the final user message for AI clip planning.
-
-    - Fixed instruction block (JSON shape, duration bounds, etc.) is always included unless
-      custom_user_prompt looks like a legacy \"full prompt\" from older clients.
-    - strategy_instructions is optional user-editable guidance (persona / priorities).
-    """
-    transcript_block = build_transcript_for_ai(sentences)
-    tail = "\n\n输入格式: 行号|start_ms|end_ms|text\n" + transcript_block
-
-    cup = (custom_user_prompt or "").strip()
-    if cup and _looks_like_legacy_full_custom_prompt(cup):
-        prompt = (
-            cup.replace("{max_clips}", str(max_clips))
-            .replace("{min_sec}", str(min_sec))
-            .replace("{max_sec}", str(max_sec))
-            .replace("{theme}", "")
-        )
-        if "输入格式" not in prompt:
-            prompt = prompt + tail
-        else:
-            # If user already inlined transcript markers, keep as-is (best effort).
-            if transcript_block not in prompt and "行号|" not in prompt:
-                prompt = prompt + "\n\n" + transcript_block
-        return prompt
-
-    fixed = build_fixed_slice_instruction_block(max_clips, min_sec, max_sec)
-    strat = (strategy_instructions or "").strip()
-    parts: list[str] = [fixed]
-    if strat:
-        parts.append("额外选段策略（在固定要求之上执行）：\n" + strat)
-    return "\n\n".join(parts) + tail
+def _strip_markdown_json_fence(text: str) -> str:
+    t = text.strip()
+    if t.startswith("```"):
+        t = re.sub(r"^```(?:json)?\s*", "", t, flags=re.I)
+        t = re.sub(r"\s*```\s*$", "", t)
+    return t.strip()
 
 
-def split_sentences_by_window(sentences: list[dict[str, Any]], window_ms: int) -> list[list[dict[str, Any]]]:
-    if window_ms <= 0:
-        return [sentences]
-    buckets: dict[int, list[dict[str, Any]]] = {}
-    for s in sentences:
-        idx = max(0, int(s["start_ms"]) // window_ms)
-        buckets.setdefault(idx, []).append(s)
-    return [buckets[k] for k in sorted(buckets.keys()) if buckets[k]]
+def _extract_balanced_json(text: str, start: int) -> str | None:
+    if start < 0 or start >= len(text):
+        return None
+    open_ch = text[start]
+    close_ch = "}" if open_ch == "{" else "]" if open_ch == "[" else ""
+    if not close_ch:
+        return None
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+            continue
+        if ch == open_ch:
+            depth += 1
+        elif ch == close_ch:
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return None
 
 
-def plan_with_ai(
-    api_key: str,
-    sentences: list[dict[str, Any]],
-    max_clips: int,
-    min_sec: int,
-    max_sec: int,
-    strategy_instructions: str | None = None,
-    custom_user_prompt: str | None = None,
-) -> tuple[list[dict[str, Any]], float]:
-    prompt = build_ai_user_prompt(
-        sentences=sentences,
-        max_clips=max_clips,
-        min_sec=min_sec,
-        max_sec=max_sec,
-        strategy_instructions=strategy_instructions,
-        custom_user_prompt=custom_user_prompt,
-    )
-
-    url = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    body = {
-        "model": "qwen-plus",
-        "messages": [
-            {"role": "system", "content": "你严格按要求返回可解析 JSON。"},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0.2,
-    }
-    data = request_json(url, "POST", headers, body)
-    content = (
-        ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
-    ).strip()
-    if not content:
-        raise RuntimeError("AI 未返回可用内容。")
-
-    cost_cny = estimate_chat_cost_cny(data, prompt, content)
-
-    # Try robust JSON extraction.
-    match = re.search(r"\[.*\]", content, flags=re.S)
-    json_text = match.group(0) if match else content
-    arr = json.loads(json_text)
-    if not isinstance(arr, list):
-        raise RuntimeError("AI 输出不是数组。")
-
+def _clips_from_parsed_json(data: Any) -> list[dict[str, Any]]:
+    if isinstance(data, dict):
+        arr = data.get("clips")
+        if arr is None:
+            for v in data.values():
+                if isinstance(v, list):
+                    arr = v
+                    break
+        data = arr
+    if not isinstance(data, list):
+        raise ValueError("根节点不是 clips 数组。")
     clips: list[dict[str, Any]] = []
-    for it in arr:
+    for it in data:
         if not isinstance(it, dict):
             continue
         try:
@@ -256,20 +254,220 @@ def plan_with_ai(
                 "reason": reason,
             }
         )
+    return clips
+
+
+def _clips_from_loose_regex(content: str) -> list[dict[str, Any]]:
+    """Fallback when JSON is broken (e.g. unescaped quotes in reason)."""
+    clips: list[dict[str, Any]] = []
+    seen: set[tuple[int, int]] = set()
+    patterns = [
+        re.compile(
+            r'"title"\s*:\s*"([^"]{0,80})"\s*,\s*"start_ms"\s*:\s*(\d+)\s*,\s*"end_ms"\s*:\s*(\d+)',
+            re.S,
+        ),
+        re.compile(
+            r'"start_ms"\s*:\s*(\d+)\s*,\s*"end_ms"\s*:\s*(\d+)',
+            re.S,
+        ),
+    ]
+    for pat in patterns:
+        for m in pat.finditer(content):
+            if len(m.groups()) == 3:
+                title, start_ms, end_ms = m.group(1), int(m.group(2)), int(m.group(3))
+            else:
+                title, start_ms, end_ms = "片段", int(m.group(1)), int(m.group(2))
+            key = (start_ms, end_ms)
+            if key in seen or end_ms <= start_ms:
+                continue
+            seen.add(key)
+            clips.append(
+                {
+                    "title": title.strip() or "片段",
+                    "start_ms": start_ms,
+                    "end_ms": end_ms,
+                    "reason": "",
+                }
+            )
+    return clips
+
+
+def parse_ai_clips_content(content: str) -> list[dict[str, Any]]:
+    text = _strip_markdown_json_fence(content)
+    errors: list[str] = []
+
+    for start_ch in ("{", "["):
+        pos = text.find(start_ch)
+        if pos < 0:
+            continue
+        chunk = _extract_balanced_json(text, pos)
+        if not chunk:
+            continue
+        try:
+            parsed = json.loads(chunk)
+            clips = _clips_from_parsed_json(parsed)
+            if clips:
+                return clips
+            errors.append(f"{start_ch} 解析成功但无有效片段")
+        except Exception as exc:
+            errors.append(f"{start_ch} json.loads: {exc}")
+
+    loose = _clips_from_loose_regex(text)
+    if loose:
+        return loose
+
+    snippet = text[:240].replace("\n", " ")
+    detail = "; ".join(errors[:2]) if errors else "无法识别片段"
+    raise ValueError(f"{detail}；响应摘要: {snippet}…")
+
+
+def build_ai_user_prompt(
+    sentences: list[dict[str, Any]],
+    min_sec: int,
+    max_sec: int,
+    slice_goal: str | None,
+    slice_logic_how: str | None,
+    custom_user_prompt: str | None,
+) -> str:
+    transcript_block = build_transcript_for_ai(sentences)
+    tail = "\n\n输入格式: 行号|start_ms|end_ms|text\n" + transcript_block
+
+    cup = (custom_user_prompt or "").strip()
+    if cup and _looks_like_legacy_full_custom_prompt(cup):
+        prompt = (
+            cup.replace("{max_clips}", "0")
+            .replace("{min_sec}", str(min_sec))
+            .replace("{max_sec}", str(max_sec))
+            .replace("{theme}", "")
+        )
+        if "输入格式" not in prompt:
+            prompt = prompt + tail
+        else:
+            if transcript_block not in prompt and "行号|" not in prompt:
+                prompt = prompt + "\n\n" + transcript_block
+        return prompt
+
+    parts: list[str] = [
+        "你是视频切片助手。根据逐句时间戳转写，为用户裁剪视频时间段。",
+    ]
+    goal = (slice_goal or "").strip()
+    if goal:
+        parts.append("【切片目标】（最高优先级，必须满足）\n" + goal)
+    logic = (slice_logic_how or "").strip()
+    if logic:
+        parts.append("【切片逻辑】\n" + logic)
+    parts.append(build_technical_constraints_block(min_sec, max_sec))
+    return "\n\n".join(parts) + tail
+
+
+def build_ai_user_prompt_with_glossary(
+    sentences: list[dict[str, Any]],
+    min_sec: int,
+    max_sec: int,
+    slice_goal: str | None,
+    slice_logic_how: str | None,
+    custom_user_prompt: str | None,
+    transcript_json: Path | None = None,
+) -> str:
+    prompt = build_ai_user_prompt(
+        sentences=sentences,
+        min_sec=min_sec,
+        max_sec=max_sec,
+        slice_goal=slice_goal,
+        slice_logic_how=slice_logic_how,
+        custom_user_prompt=custom_user_prompt,
+    )
+    if transcript_json is not None:
+        hint = load_glossary_hint(transcript_json)
+        if hint:
+            prompt = prompt + "\n\n" + hint
+    return prompt
+
+
+def split_sentences_by_window(sentences: list[dict[str, Any]], window_ms: int) -> list[list[dict[str, Any]]]:
+    if window_ms <= 0:
+        return [sentences]
+    buckets: dict[int, list[dict[str, Any]]] = {}
+    for s in sentences:
+        idx = max(0, int(s["start_ms"]) // window_ms)
+        buckets.setdefault(idx, []).append(s)
+    return [buckets[k] for k in sorted(buckets.keys()) if buckets[k]]
+
+
+def plan_with_ai(
+    api_key: str,
+    sentences: list[dict[str, Any]],
+    min_sec: int,
+    max_sec: int,
+    slice_goal: str | None = None,
+    slice_logic_how: str | None = None,
+    custom_user_prompt: str | None = None,
+    transcript_json: Path | None = None,
+) -> tuple[list[dict[str, Any]], float]:
+    prompt = build_ai_user_prompt_with_glossary(
+        sentences=sentences,
+        min_sec=min_sec,
+        max_sec=max_sec,
+        slice_goal=slice_goal,
+        slice_logic_how=slice_logic_how,
+        custom_user_prompt=custom_user_prompt,
+        transcript_json=transcript_json,
+    )
+
+    url = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    body: dict[str, Any] = {
+        "model": "qwen-plus",
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "你只输出一个合法 JSON 对象，格式为 "
+                    '{"clips":[{"title":"...","start_ms":0,"end_ms":0,"reason":"..."}]}，'
+                    "不要 markdown，不要多余说明。"
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.2,
+        "response_format": {"type": "json_object"},
+    }
+    try:
+        data = request_json(url, "POST", headers, body)
+    except RuntimeError as exc:
+        if "response_format" not in str(exc) and "json_object" not in str(exc):
+            raise
+        body.pop("response_format", None)
+        data = request_json(url, "POST", headers, body)
+
+    content = (
+        ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+    ).strip()
+    if not content:
+        raise RuntimeError("AI 未返回可用内容。")
+
+    cost_cny = estimate_chat_cost_cny(data, prompt, content)
+    clips = parse_ai_clips_content(content)
+    if not clips:
+        raise RuntimeError("AI 未返回有效片段。")
     return clips, cost_cny
 
 
 def plan_with_ai_in_chunks(
     api_key: str,
     sentences: list[dict[str, Any]],
-    max_clips: int,
     min_sec: int,
     max_sec: int,
     chunk_minutes: int,
     chunk_retries: int,
     rule_fallback_after_retries: bool,
-    strategy_instructions: str | None = None,
+    slice_goal: str | None = None,
+    slice_logic_how: str | None = None,
     custom_user_prompt: str | None = None,
+    transcript_json: Path | None = None,
 ) -> tuple[list[dict[str, Any]], float]:
     window_ms = max(1, chunk_minutes) * 60 * 1000
     chunks = split_sentences_by_window(sentences, window_ms)
@@ -277,15 +475,9 @@ def plan_with_ai_in_chunks(
         return [], 0.0
 
     n = len(chunks)
-    base = max(1, max_clips // n)
-    rem = max(0, max_clips - base * n)
-
     all_clips: list[dict[str, Any]] = []
     total_cost = 0.0
     for i, ch in enumerate(chunks, start=1):
-        quota = base + (1 if i <= rem else 0)
-        if quota <= 0:
-            continue
         clips: list[dict[str, Any]] = []
         retries = max(0, chunk_retries)
         success = False
@@ -294,11 +486,12 @@ def plan_with_ai_in_chunks(
                 clips, call_cost = plan_with_ai(
                     api_key=api_key,
                     sentences=ch,
-                    max_clips=quota,
                     min_sec=min_sec,
                     max_sec=max_sec,
-                    strategy_instructions=strategy_instructions,
+                    slice_goal=slice_goal,
+                    slice_logic_how=slice_logic_how,
                     custom_user_prompt=custom_user_prompt,
+                    transcript_json=transcript_json,
                 )
                 total_cost += float(call_cost)
                 print(
@@ -313,7 +506,7 @@ def plan_with_ai_in_chunks(
         if not success:
             if rule_fallback_after_retries:
                 print(f"第{i}/{n}段 AI 重试后仍失败，改规则兜底。")
-                clips = plan_with_rules(ch, quota, min_sec, max_sec)
+                clips = plan_with_rules(ch, RULE_FALLBACK_MAX_CLIPS, min_sec, max_sec)
             else:
                 print(f"第{i}/{n}段 AI 重试后仍失败，跳过该段（未启用规则兜底）。")
                 clips = []
@@ -326,7 +519,7 @@ def plan_with_rules(sentences: list[dict[str, Any]], max_clips: int, min_sec: in
     i = 0
     n = len(sentences)
     min_ms = min_sec * 1000
-    max_ms = max_sec * 1000
+    cap_ms = max_sec * 1000 if max_sec > 0 else 0
     punct = "。！？!?；;"
     while i < n and len(clips) < max_clips:
         start = sentences[i]["start_ms"]
@@ -337,7 +530,7 @@ def plan_with_rules(sentences: list[dict[str, Any]], max_clips: int, min_sec: in
             dur = end - start
             if dur >= min_ms and sentences[j]["text"].rstrip().endswith(tuple(punct)):
                 last_good = j
-            if dur > max_ms:
+            if cap_ms > 0 and dur > cap_ms:
                 break
             j += 1
         if last_good == -1:
@@ -359,7 +552,7 @@ def plan_with_rules(sentences: list[dict[str, Any]], max_clips: int, min_sec: in
 
 def normalize_clips(clips: list[dict[str, Any]], video_duration_ms: int, min_sec: int, max_sec: int) -> list[dict[str, Any]]:
     min_ms = min_sec * 1000
-    max_ms = max_sec * 1000
+    cap_ms = max_sec * 1000 if max_sec > 0 else 0
     out: list[dict[str, Any]] = []
     for c in clips:
         s = max(0, int(c["start_ms"]))
@@ -368,8 +561,8 @@ def normalize_clips(clips: list[dict[str, Any]], video_duration_ms: int, min_sec
             continue
         if e - s < min_ms:
             e = min(video_duration_ms, s + min_ms)
-        if e - s > max_ms:
-            e = s + max_ms
+        if cap_ms > 0 and e - s > cap_ms:
+            e = s + cap_ms
         if e <= s:
             continue
         out.append(
@@ -463,13 +656,13 @@ def run_auto_clip(
     transcript_json: Path,
     out_dir: Path,
     api_key: str,
-    max_clips: int,
-    min_sec: int,
-    max_sec: int,
-    chunk_minutes: int,
-    chunk_retries: int,
-    rule_fallback_after_retries: bool,
-    strategy_instructions: str | None = None,
+    slice_goal: str | None = None,
+    slice_logic_how: str | None = None,
+    min_sec: int = DEFAULT_MIN_SEC,
+    max_sec: int = DEFAULT_MAX_SEC,
+    chunk_minutes: int = DEFAULT_CHUNK_MINUTES,
+    chunk_retries: int = DEFAULT_CHUNK_RETRIES,
+    rule_fallback_after_retries: bool = DEFAULT_RULE_FALLBACK,
     custom_user_prompt: str | None = None,
 ) -> tuple[list[dict[str, Any]], float]:
     video = video.resolve()
@@ -481,8 +674,10 @@ def run_auto_clip(
         raise RuntimeError(f"视频不存在：{video}")
     if not transcript_json.exists():
         raise RuntimeError(f"转写文件不存在：{transcript_json}")
-    if min_sec <= 0 or max_sec <= 0 or min_sec > max_sec:
-        raise RuntimeError("min_sec/max_sec 参数非法。")
+    if min_sec <= 0:
+        raise RuntimeError("min_sec 必须大于 0。")
+    if max_sec > 0 and min_sec > max_sec:
+        raise RuntimeError("max_sec 小于 min_sec，参数非法。")
 
     sentences = load_sentences(transcript_json)
     duration_ms = probe_duration_ms(video)
@@ -493,20 +688,21 @@ def run_auto_clip(
         clips, clip_ai_cost = plan_with_ai_in_chunks(
             api_key=api_key.strip(),
             sentences=sentences,
-            max_clips=max_clips,
             min_sec=min_sec,
             max_sec=max_sec,
             chunk_minutes=chunk_minutes,
             chunk_retries=chunk_retries,
             rule_fallback_after_retries=rule_fallback_after_retries,
-            strategy_instructions=strategy_instructions,
+            slice_goal=slice_goal,
+            slice_logic_how=slice_logic_how,
             custom_user_prompt=custom_user_prompt,
+            transcript_json=transcript_json.resolve(),
         )
         print(f"AI 分段选段完成：共 {len(clips)} 段，估算解析(AI)费用约 ¥{clip_ai_cost:.6f}")
 
     if not clips:
-        clips = plan_with_rules(sentences, max_clips, min_sec, max_sec)
-        print(f"规则选段：{len(clips)} 段")
+        clips = plan_with_rules(sentences, RULE_FALLBACK_MAX_CLIPS, min_sec, max_sec)
+        print(f"AI 未产出有效片段，已改用规则兜底选段：{len(clips)} 段")
 
     clips = normalize_clips(clips, video_duration_ms=duration_ms, min_sec=min_sec, max_sec=max_sec)
     if not clips:
@@ -532,11 +728,12 @@ def main() -> None:
     parser.add_argument("--transcript-json", type=Path, required=True, help="第一步输出的 result.json")
     parser.add_argument("--out-dir", type=Path, default=Path("clip_output"), help="输出目录")
     parser.add_argument("--api-key", default="", help="可选：DashScope API Key，提供后启用 AI 选段")
-    parser.add_argument("--max-clips", type=int, default=6, help="最多生成片段数量")
-    parser.add_argument("--min-sec", type=int, default=20, help="单片段最短秒数")
-    parser.add_argument("--max-sec", type=int, default=60, help="单片段最长秒数")
-    parser.add_argument("--chunk-minutes", type=int, default=30, help="AI 分段分析时长（分钟），默认30")
-    parser.add_argument("--chunk-retries", type=int, default=2, help="每段 AI 失败后的重试次数，默认2")
+    parser.add_argument("--slice-goal", default="", help="切片目标（自然语言）")
+    parser.add_argument("--slice-logic", default=DEFAULT_SLICE_LOGIC, help="切片逻辑模式名")
+    parser.add_argument("--min-sec", type=int, default=DEFAULT_MIN_SEC, help="单片段最短秒数")
+    parser.add_argument("--max-sec", type=int, default=DEFAULT_MAX_SEC, help="单片段最长秒数，0 表示不设上限")
+    parser.add_argument("--chunk-minutes", type=int, default=DEFAULT_CHUNK_MINUTES, help="AI 分段分析窗口（分钟）")
+    parser.add_argument("--chunk-retries", type=int, default=DEFAULT_CHUNK_RETRIES, help="每窗口 AI 重试次数")
     parser.add_argument(
         "--rule-fallback-after-retries",
         action="store_true",
@@ -545,19 +742,20 @@ def main() -> None:
     args = parser.parse_args()
 
     try:
+        goal = (args.slice_goal or "").strip() or None
+        logic_how = get_logic_how(args.slice_logic)
         _, clip_cost = run_auto_clip(
             video=args.video,
             transcript_json=args.transcript_json,
             out_dir=args.out_dir,
             api_key=args.api_key,
-            max_clips=args.max_clips,
+            slice_goal=goal,
+            slice_logic_how=logic_how,
             min_sec=args.min_sec,
             max_sec=args.max_sec,
             chunk_minutes=args.chunk_minutes,
             chunk_retries=args.chunk_retries,
             rule_fallback_after_retries=args.rule_fallback_after_retries,
-            strategy_instructions=None,
-            custom_user_prompt=None,
         )
         print(f"估算解析(AI)费用合计：¥{clip_cost:.6f}")
     except Exception as exc:

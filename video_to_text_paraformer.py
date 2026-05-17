@@ -32,7 +32,6 @@ import threading
 DASHSCOPE_BASE = "https://dashscope.aliyuncs.com/api/v1"
 MODEL_NAME = "paraformer-v2"
 OUTPUT_JSON_NAME = "result.json"
-OUTPUT_TXT_NAME = "result.txt"
 DEFAULT_PRICE_PER_HOUR = 0.288
 
 
@@ -84,7 +83,12 @@ def extract_audio(video: Path, out_audio: Path) -> None:
         sys.exit(exc.returncode or 1)
 
 
-def submit_asr(api_key: str, audio_url: str, oss_resolve: bool = False) -> str:
+def submit_asr(
+    api_key: str,
+    audio_url: str,
+    oss_resolve: bool = False,
+    vocabulary_id: str | None = None,
+) -> str:
     url = f"{DASHSCOPE_BASE}/services/audio/asr/transcription"
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -93,9 +97,12 @@ def submit_asr(api_key: str, audio_url: str, oss_resolve: bool = False) -> str:
     }
     if oss_resolve:
         headers["X-DashScope-OssResourceResolve"] = "enable"
+    input_payload: dict[str, Any] = {"file_urls": [audio_url]}
+    if vocabulary_id and str(vocabulary_id).strip():
+        input_payload["vocabulary_id"] = str(vocabulary_id).strip()
     body = {
         "model": MODEL_NAME,
-        "input": {"file_urls": [audio_url]},
+        "input": input_payload,
         "parameters": {
             "sentence_timestamp_enabled": True,
             "disfluency_removal_enabled": False,
@@ -251,12 +258,18 @@ def estimate_cost_cny(task_result: dict[str, Any], sentences: list[dict[str, Any
     }
 
 
-def write_outputs(sentences: list[dict[str, Any]], out_dir: Path) -> None:
+def write_outputs(sentences: list[dict[str, Any]], out_dir: Path) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     json_file = out_dir / OUTPUT_JSON_NAME
-    txt_file = out_dir / OUTPUT_TXT_NAME
-    # Cleanup legacy output files from older versions.
-    for legacy in ("segments.json", "transcript.txt", "subtitles.srt"):
+    for legacy in (
+        "segments.json",
+        "transcript.txt",
+        "subtitles.srt",
+        "result.txt",
+        "result_corrected.json",
+        "result_corrected.txt",
+        "glossary.json",
+    ):
         legacy_path = out_dir / legacy
         if legacy_path.exists():
             legacy_path.unlink()
@@ -264,12 +277,8 @@ def write_outputs(sentences: list[dict[str, Any]], out_dir: Path) -> None:
     with json_file.open("w", encoding="utf-8") as f:
         json.dump(sentences, f, ensure_ascii=False, indent=2)
 
-    with txt_file.open("w", encoding="utf-8") as f:
-        for s in sentences:
-            f.write(f"[{s['start_hms']} - {s['end_hms']}] {s['text']}\n")
-
     print(f"输出：{json_file}")
-    print(f"输出：{txt_file}")
+    return json_file
 
 
 def main() -> None:
