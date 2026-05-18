@@ -1,2 +1,24 @@
+# 转写/切片输出
 runs/
-/build/
+
+# 打包产物与中间文件
+build/
+dist/
+*.exe
+*.spec
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 密钥与本地配置（只提交 .env.example）
+.env
+.env.local
+
+# 运行时统计
+usage_stats.json
+
+# 编辑器（保留 .cursor/rules 可提交）
+.cursor/*
+!.cursor/rules/

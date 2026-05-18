@@ -8,3 +8,5 @@ alwaysApply: true
 在本仓库中，若本轮修改了会打进 **`视频切片机.exe`** 的源码（例如 `gui.py`、`main.py`、`auto_clip_from_transcript.py` 及被入口脚本打包进 onefile 的相关模块），**在收尾前默认执行** 根目录 `build_exe.ps1`（已内含清理旧 `build/`、`dist/`、旧 exe），**无需用户再说「打包」**。
 
 若用户在该轮消息中明确说本次不要打 exe，可跳过。若打包失败且提示文件占用，提醒用户先关闭正在运行的 exe 后重试。
+
+收尾前须做简短自检：`py_compile` 改动文件；删变量/改签名后 grep 调用方，避免「修了 A 忘了 B」（如删掉赋值仍引用该变量）。详见 skill `video-to-word-exe-rebuild`。

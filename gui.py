@@ -711,6 +711,7 @@ class App:
             return
 
         slice_logic_how = get_logic_how(logic_key)
+        user_keywords = self.keywords_var.get().strip()
 
         self.clip_cancel_event.clear()
         self.clip_run_btn.configure(state=tk.DISABLED)
@@ -723,6 +724,9 @@ class App:
                 sink = QueueWriter(self._parse_log)
                 with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
                     for i, task in enumerate(selected_tasks, start=1):
+                        if self.clip_cancel_event.is_set():
+                            self._parse_log("已取消：后续任务不再切片。")
+                            break
                         title = task.get("title") or f"任务{i}"
                         transcript = Path(task["result_json"])
                         video_s = self._resolve_clip_video_for_task(task)
@@ -737,14 +741,21 @@ class App:
                             continue
 
                         self._parse_log(f"[{i}/{len(selected_tasks)}] 开始：{title}")
-                        _outputs, clip_cost = clipper.run_auto_clip(
-                            video=video,
-                            transcript_json=transcript,
-                            out_dir=out_dir,
-                            api_key=api_key,
-                            slice_goal=slice_goal,
-                            slice_logic_how=slice_logic_how,
-                        )
+                        try:
+                            _outputs, clip_cost = clipper.run_auto_clip(
+                                video=video,
+                                transcript_json=transcript,
+                                out_dir=out_dir,
+                                api_key=api_key,
+                                slice_goal=slice_goal,
+                                slice_logic_how=slice_logic_how,
+                                slice_logic_key=logic_key,
+                                cancel_event=self.clip_cancel_event,
+                                user_keywords=user_keywords,
+                            )
+                        except clipper.PipelineCancelled:
+                            self._parse_log("切片已取消。")
+                            break
                         total_cost += float(clip_cost)
                         ok_count += 1
                         self._parse_log(f"[{i}/{len(selected_tasks)}] 完成：{title}")
@@ -753,6 +764,8 @@ class App:
                 save_usage_stats(self.stats_path, self.usage_stats)
                 self.root.after(0, self._refresh_cost_summary)
                 self._parse_log(f"批量切片完成：成功 {ok_count}/{len(selected_tasks)}。")
+            except clipper.PipelineCancelled:
+                self._parse_log("切片已取消。")
             except Exception as exc:
                 self._parse_log(f"切片失败: {exc}")
             finally:
