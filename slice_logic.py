@@ -13,6 +13,11 @@ DEFAULT_SLICE_LOGIC = "按主题/关键词"
 # Shared pipeline defaults (also used by slice_strategy).
 DEFAULT_CHUNK_TARGET_TOKENS = 22_000
 
+# Clip boundary padding after AI selection (ms). Override via CLIP_HEAD_PAD_MS / CLIP_TAIL_PAD_MS.
+DEFAULT_CLIP_HEAD_PAD_MS = 400
+DEFAULT_CLIP_TAIL_PAD_MS = 1500
+DEFAULT_MERGE_NEARBY_GAP_MS = 2000
+
 SLICE_LOGIC_MODES: dict[str, dict[str, str]] = {
     "按主题/关键词": {
         "summary": "适合：找出视频中关于某主题、品牌、产品或关键词的连续讲述，合并为完整段落。",

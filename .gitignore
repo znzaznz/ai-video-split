@@ -19,6 +19,6 @@ __pycache__/
 # 运行时统计
 usage_stats.json
 
-# 编辑器（保留 .cursor/rules 可提交）
+# 编辑器（仅保留 .cursor/rules 可提交；Git 安全 hook 用用户全局 ~/.cursor）
 .cursor/*
 !.cursor/rules/

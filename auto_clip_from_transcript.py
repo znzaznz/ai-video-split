@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -26,7 +27,10 @@ from typing import Any
 from slice_logic import (
     DEFAULT_CHUNK_MINUTES,
     DEFAULT_CHUNK_RETRIES,
+    DEFAULT_CLIP_HEAD_PAD_MS,
+    DEFAULT_CLIP_TAIL_PAD_MS,
     DEFAULT_MAX_SEC,
+    DEFAULT_MERGE_NEARBY_GAP_MS,
     DEFAULT_MIN_SEC,
     DEFAULT_RULE_FALLBACK,
     DEFAULT_SLICE_LOGIC,
@@ -203,6 +207,8 @@ def build_technical_constraints_block(min_sec: int, max_sec: int) -> str:
         "4) 仅返回一个 JSON 对象，不要 markdown；格式："
         '{"clips":[{"title":"短标题","start_ms":0,"end_ms":0,"reason":"短说明"}]}\n'
         "5) title/reason 各不超过 30 字，勿使用英文双引号\n"
+        "6) start_ms/end_ms 必须取自转写行的毫秒时间戳；end_ms 取该主题"
+        "**最后一行**的 end_ms，禁止在句子中间截断；多句主题须覆盖完整最后一句\n"
     )
 
 
@@ -505,7 +511,10 @@ def plan_coarse_with_ai(
         "输入格式: 行号|start_ms|end_ms|text\n"
         + transcript_block
     )
-    system = "你是视频转写粗分助手。只输出合法 JSON，不要 markdown。"
+    system = (
+        "你是视频转写粗分助手。只输出合法 JSON，不要 markdown。"
+        "segments 的 end_ms 须对齐句尾，勿在句中截断。"
+    )
     content, _, cost = _chat_completion(
         api_key,
         model or rules.coarse_model or MODEL_COARSE,
@@ -556,7 +565,7 @@ def plan_with_ai(
     system = (
         "你是视频切片精切助手。只输出一个合法 JSON 对象："
         '{"clips":[{"title":"...","start_ms":0,"end_ms":0,"reason":"..."}]}，'
-        "不要 markdown，不要多余说明。"
+        "不要 markdown，不要多余说明。段尾须对齐转写句边界，end_ms 取主题最后一句的 end_ms。"
     )
     content, _, cost_cny = _chat_completion(
         api_key,
@@ -647,7 +656,8 @@ def refine_clips_with_ai(
     ]
     goal = (slice_goal or "").strip()
     user = (
-        "审查下列候选片段：删除不符合切片目标、命中排除条件的；合并相邻且同一主题的段。\n"
+        "审查下列候选片段：删除不符合切片目标、命中排除条件的；合并相邻且同一主题的段。"
+        "合并时不得缩短 end_ms 导致句未说完；仅删除无关段或合并重叠/相邻同主题段。\n"
         + format_exclude_block(rules.exclude_hints)
         + (f"【切片目标】\n{goal}\n\n" if goal else "")
         + f"【精切补充】\n{rules.fine_instruction}\n\n"
@@ -792,6 +802,163 @@ def execute_slice_pipeline(
         total_cost += red_cost
 
     return clips, total_cost
+
+
+SENTENCE_END_PUNCT = "。！？!?；;"
+
+
+def _clip_pad_ms_from_env(name: str, default: int) -> int:
+    try:
+        return max(0, int(os.environ.get(name, default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def get_clip_head_pad_ms() -> int:
+    return _clip_pad_ms_from_env("CLIP_HEAD_PAD_MS", DEFAULT_CLIP_HEAD_PAD_MS)
+
+
+def get_clip_tail_pad_ms() -> int:
+    return _clip_pad_ms_from_env("CLIP_TAIL_PAD_MS", DEFAULT_CLIP_TAIL_PAD_MS)
+
+
+def _ends_with_sentence_punct(text: str) -> bool:
+    t = (text or "").rstrip()
+    if not t:
+        return False
+    return t[-1] in SENTENCE_END_PUNCT
+
+
+def _sentence_indices_overlapping(
+    sentences: list[dict[str, Any]], start_ms: int, end_ms: int
+) -> list[int]:
+    out: list[int] = []
+    for i, s in enumerate(sentences):
+        sm, em = int(s["start_ms"]), int(s["end_ms"])
+        if em > start_ms and sm < end_ms:
+            out.append(i)
+    return out
+
+
+def _clip_sentence_span(
+    sentences: list[dict[str, Any]], start_ms: int, end_ms: int
+) -> tuple[int, int]:
+    indices = _sentence_indices_overlapping(sentences, start_ms, end_ms)
+    if indices:
+        return indices[0], indices[-1]
+    if not sentences:
+        return 0, 0
+    i = 0
+    for k, s in enumerate(sentences):
+        if int(s["end_ms"]) >= start_ms:
+            i = k
+            break
+    j = len(sentences) - 1
+    for k in range(len(sentences) - 1, -1, -1):
+        if int(sentences[k]["start_ms"]) <= end_ms:
+            j = k
+            break
+    if i > j:
+        j = i
+    return i, j
+
+
+def expand_clips_to_sentences(
+    clips: list[dict[str, Any]],
+    sentences: list[dict[str, Any]],
+    *,
+    head_pad_ms: int | None = None,
+    tail_pad_ms: int | None = None,
+    max_extra_sentences: int = 1,
+    video_duration_ms: int | None = None,
+) -> list[dict[str, Any]]:
+    if not clips or not sentences:
+        return clips
+    head = get_clip_head_pad_ms() if head_pad_ms is None else max(0, head_pad_ms)
+    tail = get_clip_tail_pad_ms() if tail_pad_ms is None else max(0, tail_pad_ms)
+    max_extra = max(0, int(max_extra_sentences))
+    out: list[dict[str, Any]] = []
+    for c in clips:
+        start_ms = int(c["start_ms"])
+        end_ms = int(c["end_ms"])
+        i, j = _clip_sentence_span(sentences, start_ms, end_ms)
+        new_start = max(0, int(sentences[i]["start_ms"]) - head)
+        new_end = int(sentences[j]["end_ms"]) + tail
+        extra_used = 0
+        while (
+            not _ends_with_sentence_punct(str(sentences[j].get("text", "")))
+            and j + 1 < len(sentences)
+            and extra_used < max_extra
+        ):
+            j += 1
+            extra_used += 1
+            new_end = int(sentences[j]["end_ms"]) + tail
+        if video_duration_ms is not None and video_duration_ms > 0:
+            new_end = min(new_end, video_duration_ms)
+        if new_end <= new_start:
+            continue
+        expanded = dict(c)
+        expanded["start_ms"] = new_start
+        expanded["end_ms"] = new_end
+        delta = new_end - end_ms
+        if delta > 0:
+            reason = str(c.get("reason", "")).strip()
+            suffix = f"；边界已对齐句尾(+{delta}ms)"
+            expanded["reason"] = (reason + suffix) if reason else suffix.lstrip("；")
+        out.append(expanded)
+    return out
+
+
+def merge_nearby_clips(
+    clips: list[dict[str, Any]], gap_ms: int | None = None
+) -> list[dict[str, Any]]:
+    if len(clips) < 2:
+        return clips
+    gap = DEFAULT_MERGE_NEARBY_GAP_MS if gap_ms is None else max(0, gap_ms)
+    sorted_clips = sorted(clips, key=lambda x: int(x["start_ms"]))
+    merged: list[dict[str, Any]] = [dict(sorted_clips[0])]
+    for c in sorted_clips[1:]:
+        last = merged[-1]
+        gap_actual = int(c["start_ms"]) - int(last["end_ms"])
+        if gap_actual <= gap:
+            last["end_ms"] = max(int(last["end_ms"]), int(c["end_ms"]))
+            t1 = str(last.get("title", "")).strip() or "片段"
+            t2 = str(c.get("title", "")).strip()
+            if t2 and t2 not in t1:
+                last["title"] = f"{t1}+{t2}"[:40]
+            r1 = str(last.get("reason", "")).strip()
+            r2 = str(c.get("reason", "")).strip()
+            if r2:
+                last["reason"] = f"{r1}；{r2}" if r1 else r2
+        else:
+            merged.append(dict(c))
+    return merged
+
+
+def apply_clip_boundary_expansion(
+    clips: list[dict[str, Any]],
+    sentences: list[dict[str, Any]],
+    video_duration_ms: int,
+) -> list[dict[str, Any]]:
+    if not clips:
+        return clips
+    before_ends = [int(c["end_ms"]) for c in clips]
+    expanded = expand_clips_to_sentences(
+        clips, sentences, video_duration_ms=video_duration_ms
+    )
+    for idx, c in enumerate(expanded):
+        if idx < len(before_ends):
+            delta = int(c["end_ms"]) - before_ends[idx]
+            if delta >= 500:
+                print(
+                    f"边界扩展：片段 {idx + 1} 尾部 +{delta / 1000:.1f}s（对齐句尾）"
+                )
+    merged = merge_nearby_clips(expanded)
+    if len(merged) != len(clips):
+        print(
+            f"边界合并：{len(clips)} 段 → {len(merged)} 段（间隙 ≤ {DEFAULT_MERGE_NEARBY_GAP_MS}ms）"
+        )
+    return merged
 
 
 def plan_with_rules(sentences: list[dict[str, Any]], max_clips: int, min_sec: int, max_sec: int) -> list[dict[str, Any]]:
@@ -1039,6 +1206,7 @@ def run_auto_clip(
         clips = plan_with_rules(sentences, RULE_FALLBACK_MAX_CLIPS, min_sec, max_sec)
         print(f"AI 未产出有效片段，已改用规则兜底选段：{len(clips)} 段")
 
+    clips = apply_clip_boundary_expansion(clips, sentences, video_duration_ms=duration_ms)
     clips = normalize_clips(clips, video_duration_ms=duration_ms, min_sec=min_sec, max_sec=max_sec)
     if not clips:
         raise RuntimeError("没有可切片段。")
