@@ -1,0 +1,45 @@
+---
+description: 功能做完后的验收、打包、Git 提交收尾流程（配合 Plan Build）
+alwaysApply: true
+---
+
+# 交付收尾：验收 → 打包 → 提交
+
+在 **Plan 执行完成** 或一轮 **Agent 功能改动** 结束前，除非用户明确说「不要提交 / 不要 commit / 不要 push」，按顺序执行：
+
+## 1. 自动验收（必做）
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify.ps1
+```
+
+- `py_compile` 核心模块
+- `python -m unittest discover -s tests`（不调用 DashScope，无需 API Key）
+- 任一步失败：**停止**，不修完不 commit、不宣称完成
+
+## 2. 打包 exe（改了打进 exe 的源码时）
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File build_exe.ps1
+```
+
+与 `exe-auto-build-after-changes.mdc` 一致。exe 被占用则提示用户关闭后重试。
+
+## 3. Git 提交（用户未禁止时默认做）
+
+1. `git status` + `git diff --cached --name-only`
+2. 确认无 `.env`、`__pycache__/`、`*.exe`、`runs/` 等（全局 hook + `git-commit-safety` skill）
+3. 只 `git add` 明确源码/文档路径，**禁止** `git add -A`
+4. `git commit -m "..."`：1～2 句写 **why**，中文或英文均可
+5. **不自动 `git push`**，除非用户明确要求
+
+## 4. Plan 文档（必用模板）
+
+- **新建 Plan**：复制 [`.cursor/plans/_TEMPLATE.md`](../plans/_TEMPLATE.md)，保留文末 **交付勾选** 整段。
+- **Plan / Build 完成前**：对照模板勾选并逐项确认，规则详见 [plan-done-checklist.mdc](plan-done-checklist.mdc)。
+- 勿在 Plan 里另写一套与模板冲突的收尾清单。
+
+## 例外
+
+- 仅改 README / 文档且用户说不要打包：可跳过 build_exe
+- 用户说「先别提交」：做到 verify（+ 可选 build）即可

@@ -20,6 +20,7 @@ __pycache__/
 usage_stats.json
 transcript_usage_stats.json
 
-# 编辑器（仅保留 .cursor/rules 可提交；Git 安全 hook 用用户全局 ~/.cursor）
+# 编辑器（.cursor/rules 与 .cursor/plans 可提交；Git 安全 hook 用用户全局 ~/.cursor）
 .cursor/*
 !.cursor/rules/
+!.cursor/plans/

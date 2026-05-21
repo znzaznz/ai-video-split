@@ -1,0 +1,28 @@
+---
+description: Plan Build 完成前必须对照 _TEMPLATE 文末交付勾选逐项确认
+alwaysApply: true
+---
+
+# Plan 完成清单（与 ship-workflow 配合）
+
+## 何时执行
+
+- **新建 Plan**：从 `.cursor/plans/_TEMPLATE.md` 复制，保留文末 **交付勾选** 整段；不得删掉该段。
+- **Plan Build 结束** 或宣称「做完了」之前：必须对照勾选段逐项确认，并在 Plan 或回复中标明 `[x]` / 未完成项。
+- **非 Plan 的单轮功能改动**：同样执行勾选（逻辑同 [ship-workflow.mdc](ship-workflow.mdc)）。
+
+## Agent 必做（与勾选对应）
+
+1. **联动**：改 `slice_logic` / `slice_strategy` / `auto_clip` / `transcript_correct` 等 → 检查 `gui.py`、`main.py`；删符号 → 全仓库 grep。
+2. **验收**：`scripts/verify.ps1`（失败则停止，不 commit、不宣称完成）。
+3. **打包**：若动了打进 exe 的源码 → `build_exe.ps1`（见 `exe-auto-build-after-changes.mdc`）；用户明确说不要 exe 可跳过。
+4. **Git**：`git status` + staged 列表；禁止 `git add -A`；无 `.env`/exe/`runs/` 等；仅用户要求时 commit；不自动 push。
+
+## 完整勾选列表
+
+以 **`.cursor/plans/_TEMPLATE.md` 文末「交付勾选」** 为准；勿在规则里维护第二份冗长列表（避免两处不一致）。
+
+## 例外
+
+- 仅文档且用户说不要打包 → 可跳过 `build_exe.ps1`，仍建议跑 verify（若未改代码可跳过）。
+- 用户说「先别提交」→ 做到 verify（+ 可选 build），不 commit。
