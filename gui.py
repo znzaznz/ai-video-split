@@ -17,6 +17,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
 
 import main as pipeline_main
+import transcript_pipeline as tp
 import auto_clip_from_transcript as clipper
 import transcript_correct as tc
 from slice_logic import (
@@ -93,6 +94,7 @@ def load_usage_stats(stats_path: Path) -> dict[str, float]:
             "total_cost_cny": 0.0,
             "total_seconds": 0.0,
             "total_jobs": 0.0,
+            "llm_correct_cost_cny": 0.0,
             "clip_cost_cny": 0.0,
             "clip_jobs": 0.0,
         }
@@ -102,6 +104,7 @@ def load_usage_stats(stats_path: Path) -> dict[str, float]:
             "total_cost_cny": float(data.get("total_cost_cny", 0.0)),
             "total_seconds": float(data.get("total_seconds", 0.0)),
             "total_jobs": float(data.get("total_jobs", 0.0)),
+            "llm_correct_cost_cny": float(data.get("llm_correct_cost_cny", 0.0)),
             "clip_cost_cny": float(data.get("clip_cost_cny", 0.0)),
             "clip_jobs": float(data.get("clip_jobs", 0.0)),
         }
@@ -110,6 +113,7 @@ def load_usage_stats(stats_path: Path) -> dict[str, float]:
             "total_cost_cny": 0.0,
             "total_seconds": 0.0,
             "total_jobs": 0.0,
+            "llm_correct_cost_cny": 0.0,
             "clip_cost_cny": 0.0,
             "clip_jobs": 0.0,
         }
@@ -156,7 +160,8 @@ class App:
         self.cost_summary_var = tk.StringVar()
         self._refresh_cost_summary()
 
-        env = find_env_values()
+        tp.apply_dotenv_to_environ()
+        env = tp.find_env_values()
         self.mode_var = tk.StringVar(value="local")
         self.api_key_var = tk.StringVar(value=env.get("DASHSCOPE_API_KEY", ""))
         self.out_dir_var = tk.StringVar(
@@ -185,7 +190,7 @@ class App:
                 self.root.destroy()
                 return
             self.api_key_var.set(key.strip())
-            save_env_key(self.api_key_var.get())
+            tp.save_env_key(self.api_key_var.get())
 
         self._build_ui()
         self._tick_logs()
@@ -400,11 +405,12 @@ class App:
     def _refresh_cost_summary(self) -> None:
         hours = float(self.usage_stats["total_seconds"]) / 3600.0
         asr_cost = float(self.usage_stats.get("total_cost_cny", 0.0))
+        llm_cost = float(self.usage_stats.get("llm_correct_cost_cny", 0.0))
         clip_cost = float(self.usage_stats.get("clip_cost_cny", 0.0))
-        all_cost = asr_cost + clip_cost
+        all_cost = asr_cost + llm_cost + clip_cost
         self.cost_summary_var.set(
             "累计已消耗费用："
-            f"¥{all_cost:.6f}（转写¥{asr_cost:.6f} + 解析¥{clip_cost:.6f}）    "
+            f"¥{all_cost:.6f}（转写¥{asr_cost:.6f} + 纠错¥{llm_cost:.6f} + 解析¥{clip_cost:.6f}）    "
             f"(累计时长 {hours:.3f}h, "
             f"累计任务 {int(self.usage_stats['total_jobs'])} + 解析 {int(self.usage_stats.get('clip_jobs', 0.0))})"
         )
@@ -486,7 +492,7 @@ class App:
     def _run_job(self, items: list[str]) -> None:
         try:
             mode = self.mode_var.get()
-            args = argparse_namespace(
+            args = tp.argparse_namespace(
                 api_key=self.api_key_var.get().strip(),
                 out_dir=Path(self.out_dir_var.get().strip() or "runs"),
                 poll_interval=int(self.poll_var.get().strip() or "2"),
@@ -499,18 +505,25 @@ class App:
             )
 
             self._log(f"模式: {mode}，条目数: {len(items)}")
-            sink = QueueWriter(self._log)
+            sink = tp.QueueWriter(self._log)
             with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
                 if mode == "local":
-                    summary = pipeline_main.run_local(
-                        args, cancel_event=self.cancel_event, pause_event=self.pause_event
+                    summary = tp.run_local(
+                        args,
+                        cancel_event=self.cancel_event,
+                        pause_event=self.pause_event,
+                        copy_video_to_task=True,
+                        copy_video_fn=pipeline_main.copy_local_video_to_task_dir,
                     )
                 else:
-                    summary = pipeline_main.run_url(
+                    summary = tp.run_url(
                         args, cancel_event=self.cancel_event, pause_event=self.pause_event
                     )
 
-            self.usage_stats["total_cost_cny"] += float(summary.get("total_cost_cny", 0.0))
+            self.usage_stats["total_cost_cny"] += float(summary.get("asr_cost_cny", 0.0))
+            self.usage_stats["llm_correct_cost_cny"] += float(
+                summary.get("llm_correct_cost_cny", 0.0)
+            )
             self.usage_stats["total_seconds"] += float(summary.get("total_seconds", 0.0))
             self.usage_stats["total_jobs"] += float(summary.get("processed_count", 0.0))
             save_usage_stats(self.stats_path, self.usage_stats)
@@ -538,7 +551,7 @@ class App:
         if not out_root.exists():
             self.parse_list.delete(0, tk.END)
             return
-        manifests = sorted(out_root.rglob(pipeline_main.MANIFEST_NAME), key=lambda p: p.stat().st_mtime, reverse=True)
+        manifests = sorted(out_root.rglob(tp.MANIFEST_NAME), key=lambda p: p.stat().st_mtime, reverse=True)
         for m in manifests:
             if "_url_tmp" in m.parts or "_audio_tmp" in m.parts:
                 continue
@@ -573,7 +586,7 @@ class App:
             p = Path(lv)
             if p.is_file():
                 return str(p.resolve())
-        found = pipeline_main.find_merged_source_video(Path(task["dir"]))
+        found = tp.find_merged_source_video(Path(task["dir"]))
         if found:
             return str(found.resolve())
         return ""
@@ -721,7 +734,7 @@ class App:
             ok_count = 0
             total_cost = 0.0
             try:
-                sink = QueueWriter(self._parse_log)
+                sink = tp.QueueWriter(self._parse_log)
                 with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
                     for i, task in enumerate(selected_tasks, start=1):
                         if self.clip_cancel_event.is_set():
@@ -778,37 +791,6 @@ class App:
 
         self.clip_worker = threading.Thread(target=job, daemon=True)
         self.clip_worker.start()
-
-
-def argparse_namespace(**kwargs):
-    class NS:
-        pass
-
-    ns = NS()
-    for k, v in kwargs.items():
-        setattr(ns, k, v)
-    return ns
-
-
-class QueueWriter:
-    def __init__(self, logger_func) -> None:
-        self.logger_func = logger_func
-        self._buf = ""
-
-    def write(self, s: str) -> int:
-        if not s:
-            return 0
-        self._buf += s
-        while "\n" in self._buf:
-            line, self._buf = self._buf.split("\n", 1)
-            if line.strip():
-                self.logger_func(line)
-        return len(s)
-
-    def flush(self) -> None:
-        if self._buf.strip():
-            self.logger_func(self._buf.strip())
-        self._buf = ""
 
 
 def main() -> None:

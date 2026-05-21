@@ -7,7 +7,10 @@
 [![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![DashScope](https://img.shields.io/badge/ASR-paraformer--v2-FF6A00)](https://help.aliyun.com/zh/model-studio/)
 
-Windows 图形界面，可打包为 **`视频切片机.exe`**（`build_exe.ps1`）
+Windows 图形界面：
+
+- **`视频切片机.exe`** — 转写 + 智能切片（`build_exe.ps1`）
+- **`视频转写纠错.exe`** — 仅转写与纠错（`transcript_app/build_transcript_exe.ps1`）
 
 </div>
 
@@ -85,11 +88,21 @@ python main.py --api-key "sk-xxxx" --out-dir runs url "https://www.bilibili.com/
 
 ## 打包 exe
 
+**视频切片机（转写 + 切片）**
+
 ```powershell
 .\build_exe.ps1
 ```
 
-生成根目录 **`视频切片机.exe`**。打包前请关闭正在运行的旧 exe。
+**视频转写纠错（仅转写，无切片）**
+
+```powershell
+.\transcript_app\build_transcript_exe.ps1
+```
+
+均在仓库根目录生成对应 exe。打包前请关闭正在运行的旧 exe。详见 [transcript_app/README.md](transcript_app/README.md)。
+
+转写任务费用在日志与 GUI 顶栏按 **转写（ASR）**、**纠错（LLM）** 分项显示，**合计 = 转写 + 纠错**（不再只显示转写金额）。
 
 ---
 
@@ -97,8 +110,11 @@ python main.py --api-key "sk-xxxx" --out-dir runs url "https://www.bilibili.com/
 
 | 路径 | 说明 |
 |------|------|
-| `gui.py` | 图形界面入口 |
-| `main.py` | CLI 批量转写 |
+| `gui.py` | 切片机图形界面（转写 + 解析） |
+| `transcript_app/transcript_gui.py` | 转写纠错独立 GUI |
+| `transcript_pipeline.py` | 共享转写管线（ASR + 纠错） |
+| `transcript_correct.py` | 热词 / 词表 / LLM 纠错 |
+| `main.py` | CLI 批量转写（切片机会复制 source 视频） |
 | `auto_clip_from_transcript.py` | 切片流水线 |
 | `slice_logic.py` / `slice_strategy.py` | 六种模式与自适应策略 |
 | `runs/` | 转写结果（本地，不提交） |

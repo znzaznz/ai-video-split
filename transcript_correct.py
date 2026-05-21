@@ -11,6 +11,7 @@ Layers implemented:
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -82,8 +83,20 @@ KNOWN_BRANDS = (
 
 CHAT_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
 CHAT_MODEL = "qwen-plus"
+GLOSSARY_CHAT_MODEL = "qwen-turbo"
 DEFAULT_INPUT_CNY_PER_1K = 0.004
 DEFAULT_OUTPUT_CNY_PER_1K = 0.012
+LLM_CORRECT_MAX_CHARS_PER_BATCH = 11000
+
+
+def _env_flag(name: str, default: str = "1") -> bool:
+    return os.environ.get(name, default).strip().lower() not in ("0", "false", "no", "off")
+
+
+def _ollama_config() -> tuple[str, str]:
+    base = (os.environ.get("OLLAMA_BASE_URL") or "http://127.0.0.1:11434").rstrip("/")
+    model = (os.environ.get("OLLAMA_MODEL") or "qwen2.5:7b").strip()
+    return base, model
 
 
 def request_json(url: str, method: str, headers: dict[str, str], body: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -206,6 +219,189 @@ def expand_aliases(canonical: str) -> list[str]:
         seen.add(a)
         out.append(a)
     return out
+
+
+def sample_sentences_for_glossary(sentences: list[dict[str, Any]], max_chars: int = 6000) -> str:
+    if not sentences:
+        return ""
+    n = len(sentences)
+    if n <= 40:
+        indices = list(range(n))
+    else:
+        head = list(range(min(15, n)))
+        mid_start = max(0, n // 2 - 7)
+        mid = list(range(mid_start, min(mid_start + 15, n)))
+        tail = list(range(max(0, n - 15), n))
+        indices = sorted(set(head + mid + tail))
+    parts: list[str] = []
+    total = 0
+    for i in indices:
+        text = str(sentences[i].get("text") or "").strip()
+        if not text:
+            continue
+        chunk = text if len(text) <= 400 else text[:400] + "…"
+        if total + len(chunk) > max_chars:
+            break
+        parts.append(chunk)
+        total += len(chunk)
+    return "\n".join(parts)
+
+
+def _parse_entities_json(content: str) -> list[dict[str, Any]]:
+    content = content.strip()
+    match = re.search(r"\[.*\]", content, flags=re.S)
+    json_text = match.group(0) if match else content
+    arr = json.loads(json_text)
+    if not isinstance(arr, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for it in arr:
+        if not isinstance(it, dict):
+            continue
+        canon = str(it.get("canonical") or it.get("name") or "").strip()
+        if not canon or len(canon) < 2:
+            continue
+        aliases_raw = it.get("aliases") or it.get("alias") or []
+        if isinstance(aliases_raw, str):
+            aliases = [a.strip() for a in re.split(r"[,，;；]+", aliases_raw) if a.strip()]
+        else:
+            aliases = [str(a).strip() for a in aliases_raw if str(a).strip()]
+        out.append({"canonical": canon, "aliases": aliases[:16]})
+    return out
+
+
+def extract_entities_via_ollama(text: str) -> tuple[list[dict[str, Any]], float] | None:
+    if not text.strip():
+        return None
+    base, model = _ollama_config()
+    tags_url = f"{base}/api/tags"
+    try:
+        with urllib.request.urlopen(tags_url, timeout=2) as resp:
+            if resp.status != 200:
+                return None
+    except Exception:
+        return None
+
+    prompt = (
+        "从下面语音转写抽样文本中提取专名（人名、书名、地名、术语等）。\n"
+        "只输出 JSON 数组，每项：{\"canonical\":\"标准写法\",\"aliases\":[\"常见误听1\"]}\。"
+        "不要 markdown，不要解释。若无明显专名返回 []。\n\n"
+        f"{text[:6000]}"
+    )
+    body = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+        "options": {"temperature": 0.1},
+    }
+    req = urllib.request.Request(
+        f"{base}/api/chat",
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+    content = str((data.get("message") or {}).get("content") or "").strip()
+    if not content:
+        return None
+    try:
+        entities = _parse_entities_json(content)
+    except json.JSONDecodeError:
+        return None
+    return entities, 0.0
+
+
+def extract_entities_via_dashscope(api_key: str, text: str) -> tuple[list[dict[str, Any]], float]:
+    if not api_key.strip() or not text.strip():
+        return [], 0.0
+    prompt = (
+        "从下面语音转写抽样文本中提取专名（人名、书名、地名、术语等）。\n"
+        "只输出 JSON 数组，每项字段 canonical（标准写法）、aliases（字符串数组，常见 ASR 误听）。\n"
+        "不要 markdown。\n\n"
+        f"{text[:6000]}"
+    )
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    body = {
+        "model": GLOSSARY_CHAT_MODEL,
+        "messages": [
+            {"role": "system", "content": "只返回合法 JSON 数组。"},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.1,
+    }
+    data = request_json(CHAT_URL, "POST", headers, body)
+    content = (
+        ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+    ).strip()
+    cost = estimate_chat_cost_cny(data, prompt, content)
+    try:
+        entities = _parse_entities_json(content)
+    except json.JSONDecodeError:
+        entities = []
+    return entities, cost
+
+
+def merge_glossary_entities(base: dict[str, Any], extra: list[dict[str, Any]]) -> dict[str, Any]:
+    entities = list(base.get("entities") or [])
+    seen = {str(e.get("canonical", "")).strip() for e in entities}
+    for ent in extra:
+        canon = str(ent.get("canonical", "")).strip()
+        if not canon or canon in seen:
+            continue
+        seen.add(canon)
+        entities.append(
+            {
+                "canonical": canon,
+                "aliases": expand_aliases(canon) + list(ent.get("aliases") or []),
+            }
+        )
+    out = dict(base)
+    out["entities"] = entities
+    return out
+
+
+def enrich_glossary(
+    title: str,
+    user_hints: str,
+    sentences: list[dict[str, Any]],
+    api_key: str,
+) -> tuple[dict[str, Any], float]:
+    glossary = build_glossary(title, user_hints)
+    if not _env_flag("TRANSCRIPT_GLOSSARY_LLM", "1"):
+        return glossary, 0.0
+
+    sample = sample_sentences_for_glossary(sentences)
+    if not sample.strip():
+        return glossary, 0.0
+
+    before = len(glossary.get("entities") or [])
+    cost = 0.0
+    extra: list[dict[str, Any]] = []
+    source = ""
+
+    ollama_result = extract_entities_via_ollama(sample)
+    if ollama_result is not None:
+        extra, _ = ollama_result
+        source = "Ollama"
+    elif not user_hints.strip() and api_key.strip():
+        extra, cost = extract_entities_via_dashscope(api_key, sample)
+        source = "云端"
+    elif user_hints.strip():
+        print("纠错：抽专名 Ollama 不可用，已有关键词则跳过云端抽专名。", flush=True)
+        return glossary, 0.0
+    else:
+        print("纠错：抽专名跳过（无 Ollama 且无 API Key）。", flush=True)
+        return glossary, 0.0
+
+    glossary = merge_glossary_entities(glossary, extra)
+    added = len(glossary.get("entities") or []) - before
+    if source:
+        print(f"纠错：抽专名 使用 {source}，新增 {added} 个实体", flush=True)
+    return glossary, cost
 
 
 def build_glossary(title: str, user_hints: str = "") -> dict[str, Any]:
@@ -408,6 +604,26 @@ def llm_correct_batch(
     return out, cost
 
 
+def _iter_llm_batches(
+    sentences: list[dict[str, Any]], max_chars: int = LLM_CORRECT_MAX_CHARS_PER_BATCH
+) -> list[list[dict[str, Any]]]:
+    batches: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    chars = 0
+    for s in sentences:
+        text = str(s.get("text") or "")
+        line_chars = len(text) + 16
+        if current and chars + line_chars > max_chars:
+            batches.append(current)
+            current = []
+            chars = 0
+        current.append(s)
+        chars += line_chars
+    if current:
+        batches.append(current)
+    return batches
+
+
 def llm_correct_sentences(
     api_key: str,
     sentences: list[dict[str, Any]],
@@ -415,14 +631,27 @@ def llm_correct_sentences(
     title: str,
     batch_size: int = 35,
 ) -> tuple[list[dict[str, Any]], float]:
+    del batch_size  # 兼容旧调用；按字符预算分批
     if not api_key.strip():
         return sentences, 0.0
+    batches = _iter_llm_batches(sentences)
+    if not batches:
+        return sentences, 0.0
+    total_batches = len(batches)
     total_cost = 0.0
     merged: list[dict[str, Any]] = []
-    for i in range(0, len(sentences), batch_size):
-        batch = sentences[i : i + batch_size]
+    for bi, batch in enumerate(batches, start=1):
+        print(f"纠错 LLM：第 {bi}/{total_batches} 批（本批 {len(batch)} 句）…", flush=True)
         corrected, cost = llm_correct_batch(api_key, batch, glossary, title)
         total_cost += cost
+        expected = {int(s.get("index") or 0) for s in batch}
+        returned = {int(s.get("index") or 0) for s in corrected}
+        missing = expected - returned
+        if missing:
+            print(
+                f"纠错 LLM：第 {bi} 批有 {len(missing)} 句未返回，保留原文。",
+                flush=True,
+            )
         merged.extend(corrected)
     return merged, total_cost
 
@@ -445,21 +674,29 @@ def run_post_asr_correction(
 ) -> tuple[list[dict[str, Any]], float]:
     """Layer 2 + 4 after raw ASR. Returns (corrected sentences, llm cost cny)."""
     output_dir = output_dir.resolve()
+    llm_cost = 0.0
     if glossary is None:
+        glossary, extract_cost = enrich_glossary(
+            task_title, user_keywords, sentences, api_key
+        )
+        llm_cost += extract_cost
+    else:
         glossary = build_glossary(task_title, user_keywords)
 
     n_entities = len(glossary.get("entities") or [])
-    print(f"纠错：从标题/关键词生成词表 {n_entities} 个实体（不落盘）", flush=True)
+    print(f"纠错：词表共 {n_entities} 个实体（不落盘）", flush=True)
 
     corrected = apply_glossary(sentences, glossary)
     changed = sum(1 for a, b in zip(sentences, corrected) if a.get("text") != b.get("text"))
     print(f"纠错：规则替换修正 {changed}/{len(sentences)} 句", flush=True)
 
-    llm_cost = 0.0
     if enable_llm and api_key.strip():
         try:
-            corrected, llm_cost = llm_correct_sentences(api_key, corrected, glossary, task_title)
-            print(f"纠错：LLM 润色完成，估算费用约 ¥{llm_cost:.6f}", flush=True)
+            corrected, correct_cost = llm_correct_sentences(
+                api_key, corrected, glossary, task_title
+            )
+            llm_cost += correct_cost
+            print(f"纠错：LLM 润色完成，估算费用约 ¥{correct_cost:.6f}", flush=True)
         except Exception as exc:
             print(f"纠错：LLM 失败（保留规则结果）：{exc}", flush=True)
     elif enable_llm:

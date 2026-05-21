@@ -1,0 +1,14 @@
+---
+description: Auto-run PyInstaller for transcript standalone exe after related changes
+alwaysApply: true
+---
+
+# 改完代码默认打 exe（视频转写纠错）
+
+在本仓库中，若本轮修改了会打进 **`视频转写纠错.exe`** 的源码（例如 `transcript_app/**`、`transcript_pipeline.py`、`transcript_correct.py`、`video_to_text_paraformer.py`），**在收尾前默认执行** `transcript_app/build_transcript_exe.ps1`（已内含清理旧 `build/`、`dist/`、旧 exe），**无需用户再说「打包」**。
+
+若同时改动切片机入口（`gui.py`、`main.py`、`auto_clip_from_transcript.py` 等），还需执行根目录 `build_exe.ps1` 回归 **`视频切片机.exe`**。
+
+若用户明确说本次不要打 exe，可跳过。打包失败且提示文件占用时，提醒用户先关闭正在运行的 exe。
+
+收尾前须做简短自检：`py_compile` 改动文件；打包后**启动刚生成的 exe** 做最小冒烟（能开窗口、能读 `.env`）。长视频 ASR 可不在每轮 CI 中跑满。

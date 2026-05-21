@@ -1,0 +1,15 @@
+---
+description: Checklist when authoring Cursor plans for this repo (migration / exe / reuse)
+alwaysApply: false
+---
+
+# Plan 生成检查项（本仓库）
+
+制定 **Plan 模式** 计划时，除任务本身外应写明：
+
+1. **少增文件**：优先扩展现有模块；能删则删重复 helper；新能力写入 `transcript_pipeline.py` / `transcript_correct.py` 等已有文件。
+2. **迁移里程碑**：每阶段结束 `py_compile` → 相关 `build_*_exe.ps1`（清旧 `build/`、`dist/`、旧 exe）→ **启动新生成 exe** 冒烟测通再继续。
+3. **双 exe**：若改动共享转写管线，计划收尾须含 `transcript_app/build_transcript_exe.ps1` 与根目录 `build_exe.ps1`（视改动范围）。
+4. **费用与日志**：转写/纠错/切片费用分项；长任务需进度日志，避免「假死」。
+5. **输出兼容**：`runs/<task>/result.json` 与切片机解析页互通；约定是否复制 `source.mp4`。
+6. **不在计划文件里改**：实施时不要编辑 `.plan.md` 本身。
