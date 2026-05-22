@@ -20,10 +20,10 @@ Windows 图形界面：
 
 | 步骤 | 说明 |
 |------|------|
-| **输入** | 本地 MP4/MKV 等，或 B 站 / 直链 URL（B 站自动 `yt-dlp` 拉音频） |
+| **输入** | 本地 MP4/MKV 等，或 B 站 / **抖音** 链接与分享文案（`yt-dlp` 下载） |
 | **转写** | 百炼 `paraformer-v2`，句级时间戳 → `runs/.../result.json` |
 | **切片** | 六种切片逻辑 + 自适应流水线（检索 / 粗分 / 精切，长稿自动分档） |
-| **输出** | `clip_output/` 下导出剪辑片段 |
+| **输出** | 切片 MP4 统一在 `runs/clip/`（按时间序号命名）；`clip_plan.json` 在各任务目录 |
 
 ```mermaid
 flowchart LR
@@ -118,6 +118,19 @@ python main.py --api-key "sk-xxxx" --out-dir runs url "https://www.bilibili.com/
 | `auto_clip_from_transcript.py` | 切片流水线 |
 | `slice_logic.py` / `slice_strategy.py` | 六种模式与自适应策略 |
 | `runs/` | 转写结果（本地，不提交） |
+| `transcript_cli.py` | 转写专用 CLI（供 chat-ui 调用） |
+| `video_platform.py` | B 站 / 抖音链接识别 |
+| `transcript_app/chat-ui/` | Electron 转写查证（Gemini 对话，UI 同姊妹项目 bilibili-to-text） |
+
+### 转写查证客户端（Electron）
+
+```powershell
+cd transcript_app\chat-ui
+npm install
+npm run dev
+```
+
+抖音 Cookie 与排障见 [docs/troubleshoot-douyin.md](docs/troubleshoot-douyin.md)。姊妹仓库 [bilibili-to-text](../bilibili-to-text) 为独立转写+对话项目，本仓库已迁入同等转写能力与 UI。
 
 ---
 

@@ -27,6 +27,17 @@ from slice_logic import (
     get_logic_how,
     get_logic_summary,
 )
+from slice_strategy import (
+    TIME_RANGE_MODE,
+    TIME_RANGE_PARSE_HINT,
+    TIME_RANGE_PARSE_HINT_NO_KEY,
+    format_ms_hms,
+    resolve_time_range_with_pad,
+)
+
+TIME_RANGE_SUBMIT_HINT = (
+    "填写起止时间后点击「开始切片」解析（支持自然语言，如七分钟到八分20秒、7:00-8:00）。"
+)
 
 
 def load_env_values(env_path: Path) -> dict[str, str]:
@@ -346,6 +357,15 @@ class App:
 
         self.slice_logic_text = scrolledtext.ScrolledText(right, height=8, wrap=tk.WORD)
         self.slice_logic_text.pack(fill=tk.BOTH, expand=False, pady=(6, 0))
+
+        self.time_range_preview_var = tk.StringVar(value="")
+        self.time_range_preview_label = ttk.Label(
+            right,
+            textvariable=self.time_range_preview_var,
+            wraplength=520,
+            foreground="#555555",
+        )
+        self.time_range_preview_label.pack(anchor="w", pady=(4, 0))
         self._on_slice_logic_change()
 
         clip_btns = ttk.Frame(right)
@@ -693,6 +713,15 @@ class App:
         self.slice_logic_summary_var.set(get_logic_summary(key))
         self.slice_logic_text.delete("1.0", tk.END)
         self.slice_logic_text.insert(tk.END, get_logic_default_text(key))
+        self._set_time_range_hint()
+
+    def _set_time_range_hint(self) -> None:
+        key = self.slice_logic_choice.get().strip() or DEFAULT_SLICE_LOGIC
+        if key == TIME_RANGE_MODE:
+            self.time_range_preview_label.configure(foreground="#555555")
+            self.time_range_preview_var.set(TIME_RANGE_SUBMIT_HINT)
+        else:
+            self.time_range_preview_var.set("")
 
     def _cancel_clip(self) -> None:
         self.clip_cancel_event.set()
@@ -722,6 +751,31 @@ class App:
         if not slice_goal:
             messagebox.showinfo("提示", "请填写切片逻辑说明。")
             return
+        time_range_resolved: tuple[int, int, int, str] | None = None
+        if logic_key == TIME_RANGE_MODE:
+            dur_ms: int | None = None
+            if selected_tasks:
+                try:
+                    rj = Path(selected_tasks[0].get("result_json") or "")
+                    if rj.is_file():
+                        data = json.loads(rj.read_text(encoding="utf-8"))
+                        if isinstance(data, list) and data:
+                            dur_ms = max(
+                                int(s.get("end_ms", 0)) for s in data if isinstance(s, dict)
+                            )
+                except Exception:
+                    dur_ms = None
+            time_range_resolved = resolve_time_range_with_pad(
+                slice_goal, api_key=api_key, duration_ms=dur_ms
+            )
+            if not time_range_resolved:
+                hint = (
+                    TIME_RANGE_PARSE_HINT
+                    if api_key.startswith("sk-")
+                    else TIME_RANGE_PARSE_HINT_NO_KEY
+                )
+                messagebox.showerror("时间范围无效", hint)
+                return
 
         slice_logic_how = get_logic_how(logic_key)
         user_keywords = self.keywords_var.get().strip()
@@ -730,10 +784,28 @@ class App:
         self.clip_run_btn.configure(state=tk.DISABLED)
         self.clip_cancel_btn.configure(state=tk.NORMAL)
 
+        out_root = Path(self.out_dir_var.get().strip() or "runs").resolve()
+        clip_dir = out_root / "clip"
+        clip_dir.mkdir(parents=True, exist_ok=True)
+
         def job() -> None:
             ok_count = 0
             total_cost = 0.0
             try:
+                if time_range_resolved:
+                    start_ms, end_ms, pad_ms, src = time_range_resolved
+                    tag = "（AI 解析）" if src == "llm" else ""
+                    if pad_ms > 0:
+                        lo = max(0, start_ms - pad_ms)
+                        hi = end_ms + pad_ms
+                        self._parse_log(
+                            f"时间范围{tag}：{format_ms_hms(lo)}–{format_ms_hms(hi)} "
+                            f"（核心 {format_ms_hms(start_ms)}–{format_ms_hms(end_ms)}，前后各 {pad_ms // 1000}s）"
+                        )
+                    else:
+                        self._parse_log(
+                            f"时间范围{tag}：{format_ms_hms(start_ms)}–{format_ms_hms(end_ms)}"
+                        )
                 sink = tp.QueueWriter(self._parse_log)
                 with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
                     for i, task in enumerate(selected_tasks, start=1):
@@ -744,7 +816,7 @@ class App:
                         transcript = Path(task["result_json"])
                         video_s = self._resolve_clip_video_for_task(task)
                         video = Path(video_s) if video_s else Path()
-                        out_dir = Path(task["dir"]) / "clip_output"
+                        meta_dir = Path(task["dir"]).resolve()
 
                         if not transcript.is_file():
                             self._parse_log(f"[{i}/{len(selected_tasks)}] {title} 跳过：找不到 result.json")
@@ -758,7 +830,8 @@ class App:
                             _outputs, clip_cost = clipper.run_auto_clip(
                                 video=video,
                                 transcript_json=transcript,
-                                out_dir=out_dir,
+                                clip_dir=clip_dir,
+                                meta_dir=meta_dir,
                                 api_key=api_key,
                                 slice_goal=slice_goal,
                                 slice_logic_how=slice_logic_how,

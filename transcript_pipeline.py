@@ -23,6 +23,17 @@ from pathlib import Path
 from typing import Any
 
 import transcript_correct as tc
+import transcript_polish as tpol
+from video_platform import (
+    Platform,
+    detect_platform,
+    extract_bilibili_bvid,
+    extract_douyin_video_id,
+    extract_url_from_paste,
+    is_bilibili_url,
+    normalize_entry_url,
+    platform_label,
+)
 from video_to_text_paraformer import (
     DEFAULT_PRICE_PER_HOUR,
     MODEL_NAME,
@@ -45,6 +56,9 @@ def get_subprocess_window_kwargs() -> dict[str, Any]:
 
 MANIFEST_NAME = "task_manifest.json"
 TRANSCRIPT_USAGE_STATS_NAME = "transcript_usage_stats.json"
+CHECKPOINT_NAME = "_done_checkpoint.json"
+LEGACY_URL_CHECKPOINT = "_url_done_checkpoint.json"
+LEGACY_BILIBILI_CHECKPOINT = "_bilibili_done_checkpoint.json"
 
 
 def merge_job_cost(asr: dict[str, float], llm_cost: float) -> dict[str, float]:
@@ -62,12 +76,13 @@ def merge_job_cost(asr: dict[str, float], llm_cost: float) -> dict[str, float]:
 def print_job_cost(task_name: str, cost: dict[str, float], sentence_count: int) -> None:
     print(f"[{task_name}] 完成，共 {sentence_count} 句")
     print(
-        f"[{task_name}] 费用：转写约 ¥{cost['asr_cost_cny']:.6f} "
-        f"(时长 {cost['billed_seconds']:.2f}s, 单价 ¥{cost['price_per_hour_cny']}/小时)"
+        f"[{task_name}] 费用：转写约 {cost['asr_cost_cny']:.6f} 元 "
+        f"(时长 {cost['billed_seconds']:.2f}s, 单价 {cost['price_per_hour_cny']} 元/小时)"
     )
     if cost.get("llm_correct_cost_cny", 0) > 0:
-        print(f"[{task_name}] 费用：纠错 LLM 约 ¥{cost['llm_correct_cost_cny']:.6f}")
-    print(f"[{task_name}] 费用：合计约 ¥{cost['estimated_cost_cny']:.6f}")
+        label = cost.get("post_asr_label", "纠错")
+        print(f"[{task_name}] 费用：{label} LLM 约 {cost['llm_correct_cost_cny']:.6f} 元")
+    print(f"[{task_name}] 费用：合计约 {cost['estimated_cost_cny']:.6f} 元")
     print("")
 
 
@@ -96,8 +111,8 @@ def print_batch_cost_summary(totals: dict[str, float], processed_count: int, ski
         print(
             f"[批量汇总] 新处理 {processed_count} 个，"
             f"总时长 {totals['total_seconds']:.2f}s，"
-            f"合计约 ¥{totals['total_cost_cny']:.6f} "
-            f"(转写 ¥{totals['asr_cost_cny']:.6f} + 纠错 ¥{totals['llm_correct_cost_cny']:.6f})"
+            f"合计约 {totals['total_cost_cny']:.6f} 元 "
+            f"(转写 {totals['asr_cost_cny']:.6f} + 纠错 {totals['llm_correct_cost_cny']:.6f} 元)"
         )
     if skipped_count > 0:
         print(f"[批量汇总] 跳过 {skipped_count} 个。")
@@ -204,7 +219,7 @@ def format_transcript_cost_summary(stats: dict[str, float]) -> str:
     llm = float(stats.get("llm_correct_cost_cny", 0.0))
     total = float(stats.get("total_cost_cny", asr + llm))
     return (
-        f"累计费用：¥{total:.6f}（转写¥{asr:.6f} + 纠错¥{llm:.6f}）    "
+        f"累计费用：{total:.6f} 元（转写{asr:.6f} + 纠错{llm:.6f} 元）    "
         f"(累计时长 {hours:.3f}h, 任务 {int(stats.get('total_jobs', 0))})"
     )
 
@@ -240,11 +255,28 @@ class QueueWriter:
         self._buf = ""
 
 
+def normalize_post_asr_mode(args: argparse.Namespace) -> str:
+    mode = str(
+        getattr(args, "post_asr_mode", None)
+        or os.environ.get("TRANSCRIPT_POST_ASR_MODE", "correct")
+        or "correct"
+    ).strip().lower()
+    if mode not in ("correct", "polish", "none"):
+        mode = "correct"
+    if bool(getattr(args, "no_llm_correct", False)) and mode == "correct":
+        return "none"
+    return mode
+
+
 def correction_kwargs_from_args(args: argparse.Namespace) -> dict[str, Any]:
     kw = getattr(args, "user_keywords", None) or getattr(args, "keywords", "") or ""
+    mode = normalize_post_asr_mode(args)
+    enable_llm = mode == "correct" and not bool(getattr(args, "no_llm_correct", False))
     return {
         "user_keywords": str(kw),
-        "enable_llm_correct": not bool(getattr(args, "no_llm_correct", False)),
+        "enable_llm_correct": enable_llm,
+        "post_asr_mode": mode,
+        "polish_model": str(getattr(args, "polish_model", tpol.DEFAULT_POLISH_MODEL) or tpol.DEFAULT_POLISH_MODEL),
     }
 
 
@@ -348,19 +380,84 @@ def upload_to_dashscope_tmp(api_key: str, local_audio: Path) -> str:
     return f"oss://{object_key}"
 
 
-def is_bilibili_url(url: str) -> bool:
-    try:
-        host = urllib.parse.urlparse(url).netloc.lower()
-    except Exception:
+def _cookies_file_has_entries(path: Path) -> bool:
+    if not path.is_file():
         return False
-    return host.endswith("bilibili.com") or host == "b23.tv"
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "\t" in line:
+            return True
+    return False
 
 
-def extract_bilibili_bvid(url: str) -> str:
-    parsed = urllib.parse.urlparse(url)
-    stem = Path(parsed.path).stem or ""
-    m = re.search(r"(BV[\w]+)", stem, flags=re.IGNORECASE)
-    return m.group(1) if m else stem
+def yt_dlp_cookie_args() -> list[str]:
+    apply_dotenv_to_environ()
+    root = get_runtime_base_dir()
+    cookies_file = (os.environ.get("YT_DLP_COOKIES") or "").strip()
+    if cookies_file:
+        p = Path(cookies_file)
+        if not p.is_absolute():
+            p = (root / p).resolve()
+        if p.is_file() and _cookies_file_has_entries(p):
+            return ["--cookies", str(p)]
+    default = root / "cookies.txt"
+    if _cookies_file_has_entries(default):
+        return ["--cookies", str(default.resolve())]
+    browser = (os.environ.get("YT_DLP_COOKIES_FROM_BROWSER") or "").strip()
+    if browser:
+        return ["--cookies-from-browser", browser]
+    return []
+
+
+def _format_download_error(exc: BaseException, platform: Platform) -> str:
+    text = str(exc)
+    if platform != "douyin":
+        return text
+    extra = []
+    if "DPAPI" in text or "decrypt" in text.lower():
+        extra.append(
+            "Windows 无法从浏览器读取 Cookie：请导出 Netscape cookies.txt 到仓库根目录，"
+            "并在 .env 设置 YT_DLP_COOKIES=cookies.txt。"
+        )
+    elif "Fresh cookies" in text:
+        extra.append("请在浏览器打开该抖音视频并过验证后，重新导出 cookies.txt。")
+    else:
+        extra.append("运行 python tools/doctor.py 做预检；详见 docs/troubleshoot-douyin.md。")
+    extra.append("Electron「转写查证」可点击「登录抖音」同步 Cookie 后重试。")
+    return f"{text}\n" + " ".join(extra)
+
+
+def resolve_checkpoint_path(out_root: Path) -> Path:
+    new_path = out_root / CHECKPOINT_NAME
+    for legacy in (LEGACY_URL_CHECKPOINT, LEGACY_BILIBILI_CHECKPOINT):
+        leg = out_root / legacy
+        if new_path.exists():
+            break
+        if leg.exists():
+            done = load_done_urls(leg)
+            if done:
+                save_done_urls(new_path, done)
+            break
+    return new_path
+
+
+def load_done_urls_merged(out_root: Path) -> tuple[Path, set[str]]:
+    path = resolve_checkpoint_path(out_root)
+    done = load_done_urls(path)
+    for legacy in (LEGACY_URL_CHECKPOINT, LEGACY_BILIBILI_CHECKPOINT):
+        leg = out_root / legacy
+        if leg.exists() and leg != path:
+            done |= load_done_urls(leg)
+    return path, done
+
+
+def fetch_douyin_entry(
+    url: str,
+    cancel_event: threading.Event | None = None,
+    pause_event: threading.Event | None = None,
+) -> list[dict[str, str]]:
+    title = fetch_ytdlp_title(url, cancel_event=cancel_event, pause_event=pause_event) or ""
+    return [{"url": normalize_entry_url(url), "title": title}]
 
 
 def fetch_ytdlp_title(
@@ -370,6 +467,7 @@ def fetch_ytdlp_title(
 ) -> str | None:
     cmd = [
         "yt-dlp",
+        *yt_dlp_cookie_args(),
         "--no-warnings",
         "--no-playlist",
         "--skip-download",
@@ -428,6 +526,7 @@ def fetch_bilibili_entries(
 ) -> list[dict[str, str]]:
     cmd = [
         "yt-dlp",
+        *yt_dlp_cookie_args(),
         "--no-warnings",
         "--flat-playlist",
         "-J",
@@ -664,20 +763,36 @@ def _yt_dlp_popen_communicate(
         raise RuntimeError(detail.strip() or "yt-dlp 失败")
 
 
-def download_bilibili_source_video(
+def download_source_video(
     url: str,
+    platform: Platform,
     item_out: Path,
     cancel_event: threading.Event | None = None,
     pause_event: threading.Event | None = None,
 ) -> Path:
     item_out.mkdir(parents=True, exist_ok=True)
     out_template = str(item_out / "source.%(ext)s")
+    if platform == "bilibili":
+        format_args = [
+            "-f",
+            "bv*+ba/bestvideo+bestaudio/best",
+            "--merge-output-format",
+            "mp4",
+        ]
+        not_found_msg = "B 站视频下载完成但未找到 source 视频文件。"
+    else:
+        format_args = [
+            "-f",
+            "bestvideo+bestaudio/best/best",
+            "--merge-output-format",
+            "mp4",
+        ]
+        not_found_msg = "抖音视频下载完成但未找到 source 视频文件。"
+
     cmd = [
         "yt-dlp",
-        "-f",
-        "bv*+ba/bestvideo+bestaudio/best",
-        "--merge-output-format",
-        "mp4",
+        *yt_dlp_cookie_args(),
+        *format_args,
         "--no-playlist",
         "--no-warnings",
         "--newline",
@@ -699,8 +814,17 @@ def download_bilibili_source_video(
 
     video_path = find_merged_source_video(item_out)
     if not video_path:
-        raise RuntimeError("B站视频下载完成但未找到 source 视频文件。")
+        raise RuntimeError(not_found_msg)
     return video_path
+
+
+def download_bilibili_source_video(
+    url: str,
+    item_out: Path,
+    cancel_event: threading.Event | None = None,
+    pause_event: threading.Event | None = None,
+) -> Path:
+    return download_source_video(url, "bilibili", item_out, cancel_event, pause_event)
 
 
 def download_bilibili_audio(
@@ -778,6 +902,8 @@ def process_single_source(
     task_title: str = "",
     user_keywords: str = "",
     enable_llm_correct: bool = True,
+    post_asr_mode: str = "correct",
+    polish_model: str = tpol.DEFAULT_POLISH_MODEL,
 ) -> dict[str, float]:
     vocabulary_id: str | None = None
     try:
@@ -815,22 +941,43 @@ def process_single_source(
     if not sentences:
         raise RuntimeError(f"[{output_dir.name}] 未解析到句级时间戳。")
 
+    mode = (post_asr_mode or "correct").strip().lower()
+    if mode not in ("correct", "polish", "none"):
+        mode = "correct"
+
     llm_cost = 0.0
+    post_label = "纠错"
     try:
-        _, llm_cost = tc.run_post_asr_correction(
-            api_key=api_key,
-            output_dir=output_dir,
-            sentences=sentences,
-            task_title=task_title or output_dir.name,
-            user_keywords=user_keywords,
-            enable_llm=enable_llm_correct,
-        )
+        if mode == "polish":
+            post_label = "润色"
+            print(f"[{output_dir.name}] 转写后轻量润色（{polish_model}）…")
+            polished = tpol.polish_sentences(api_key, sentences, model=polish_model)
+            write_outputs(polished, output_dir)
+        elif mode == "none":
+            post_label = "无"
+            write_outputs(sentences, output_dir)
+        else:
+            _, llm_cost = tc.run_post_asr_correction(
+                api_key=api_key,
+                output_dir=output_dir,
+                sentences=sentences,
+                task_title=task_title or output_dir.name,
+                user_keywords=user_keywords,
+                enable_llm=enable_llm_correct,
+            )
     except Exception as exc:
-        print(f"[{output_dir.name}] 转写后纠错失败，写入未纠错稿：{exc}")
+        if mode == "polish":
+            print(f"[{output_dir.name}] 润色失败，写入原稿：{exc}")
+        elif mode == "correct":
+            print(f"[{output_dir.name}] 转写后纠错失败，写入未纠错稿：{exc}")
+        else:
+            print(f"[{output_dir.name}] 写入原稿失败：{exc}")
         write_outputs(sentences, output_dir)
 
     asr_cost = estimate_cost_cny(task_result, sentences, price_per_hour=DEFAULT_PRICE_PER_HOUR)
     job_cost = merge_job_cost(asr_cost, llm_cost)
+    job_cost["post_asr_label"] = post_label
+    job_cost["post_asr_mode"] = mode
     print_job_cost(output_dir.name, job_cost, len(sentences))
     return job_cost
 
@@ -983,14 +1130,13 @@ def run_url(
     out_root.mkdir(parents=True, exist_ok=True)
     url_tmp = out_root / "_url_tmp"
     url_tmp.mkdir(parents=True, exist_ok=True)
-    checkpoint_path = out_root / "_url_done_checkpoint.json"
-    done_urls = load_done_urls(checkpoint_path)
+    checkpoint_path, done_urls = load_done_urls_merged(out_root)
 
     totals = new_run_cost_totals()
     processed_count = 0
     ck = correction_kwargs_from_args(args)
 
-    for idx, media_url in enumerate(args.urls, start=1):
+    for idx, raw_input in enumerate(args.urls, start=1):
         if cancel_event and cancel_event.is_set():
             print("已取消：后续链接不再处理。")
             break
@@ -1004,151 +1150,135 @@ def run_url(
         if not paused:
             break
 
-        if is_bilibili_url(media_url):
-            bilibili_items = fetch_bilibili_entries(
+        media_url = normalize_entry_url(extract_url_from_paste(raw_input))
+        if not media_url:
+            print(f"跳过（无法解析链接）：{raw_input!r}", file=sys.stderr)
+            continue
+
+        platform = detect_platform(media_url)
+        if not platform:
+            print(
+                f"跳过（仅支持 B 站 / 抖音）：{media_url}",
+                file=sys.stderr,
+            )
+            continue
+
+        if platform == "bilibili":
+            items = fetch_bilibili_entries(
                 media_url, cancel_event=cancel_event, pause_event=pause_event
             )
-            if not bilibili_items:
-                bilibili_items = [{"url": media_url, "title": ""}]
-            if len(bilibili_items) > 1:
-                print(f"检测到 B 站合集/多分P，共 {len(bilibili_items)} 个条目，将逐个处理。")
-
-            for sub_idx, item in enumerate(bilibili_items, start=1):
-                entry_url = item.get("url") or media_url
-                if entry_url in done_urls:
-                    print(f"[skip] 已完成，跳过：{entry_url}")
-                    continue
-                parsed = urllib.parse.urlparse(entry_url)
-                base_name = Path(parsed.path).stem or f"url_{idx}_{sub_idx}"
-                name = sanitize_name(base_name)
-                bv = extract_bilibili_bvid(entry_url) or name
-                display_name = (item.get("title") or "").strip()
-                if not display_name:
-                    display_name = fetch_ytdlp_title(
-                        entry_url, cancel_event=cancel_event, pause_event=pause_event
-                    ) or ""
-                display_name = display_name.strip() or bv
-                item_out = out_root / sanitize_name(f"{display_name}_{sub_idx:02d}")
-                task_key = item_out.name
-                local_wav = url_tmp / f"{task_key}.wav"
-                local_video_path: Path | None = find_merged_source_video(item_out)
-                try:
-                    wav_ok = local_wav.exists() and local_wav.stat().st_size > 0
-                    if wav_ok and local_video_path:
-                        print(f"[{task_key}] 复用已缓存音视频：wav={local_wav} video={local_video_path}")
-                    elif local_video_path and not wav_ok:
-                        print(f"[{task_key}] 复用已下载视频并提取音频：{local_video_path}")
-                        extract_wav_for_asr(local_video_path, local_wav)
-                        print(f"[{task_key}] 已提取音频：{local_wav}")
-                    elif wav_ok and not local_video_path:
-                        print(
-                            f"[{task_key}] 仅有历史 wav、缺少切片用视频，重新下载视频：{entry_url}"
-                        )
-                        local_video_path = download_bilibili_source_video(
-                            entry_url, item_out, cancel_event=cancel_event, pause_event=pause_event
-                        )
-                        print(f"[{task_key}] 已下载视频：{local_video_path}")
-                        extract_wav_for_asr(local_video_path, local_wav)
-                        print(f"[{task_key}] 已同步提取音频：{local_wav}")
-                    else:
-                        print(f"[{task_key}] 检测到 B 站链接，先下载视频并转音频：{entry_url}")
-                        local_video_path = download_bilibili_source_video(
-                            entry_url, item_out, cancel_event=cancel_event, pause_event=pause_event
-                        )
-                        print(f"[{task_key}] 已下载视频：{local_video_path}")
-                        extract_wav_for_asr(local_video_path, local_wav)
-                        print(f"[{task_key}] 已提取音频：{local_wav}")
-                    oss_url = upload_to_dashscope_tmp(args.api_key, local_wav)
-                    print(f"[{task_key}] 已上传临时存储: {oss_url}")
-                    cost = process_single_source(
-                        api_key=args.api_key,
-                        media_url=oss_url,
-                        output_dir=item_out,
-                        poll_interval=args.poll_interval,
-                        timeout=args.timeout,
-                        oss_resolve=True,
-                        cancel_event=cancel_event,
-                        pause_event=pause_event,
-                        task_title=display_name,
-                        **ck,
-                    )
-                    write_task_manifest(
-                        item_out,
-                        {
-                            "task_name": task_key,
-                            "mode": "url",
-                            "source_url": entry_url,
-                            "local_video": str(local_video_path.resolve()) if local_video_path else "",
-                            "local_audio": str(local_wav.resolve()),
-                            "user_keywords": ck.get("user_keywords", ""),
-                            **manifest_transcript_fields(item_out),
-                        },
-                    )
-                except Exception as exc:
-                    print(f"[{task_key}] 媒体下载/转码失败，回退直链识别：{exc}")
-                    cost = process_single_source(
-                        api_key=args.api_key,
-                        media_url=entry_url,
-                        output_dir=item_out,
-                        poll_interval=args.poll_interval,
-                        timeout=args.timeout,
-                        oss_resolve=False,
-                        cancel_event=cancel_event,
-                        pause_event=pause_event,
-                        task_title=display_name,
-                        **ck,
-                    )
-                    write_task_manifest(
-                        item_out,
-                        {
-                            "task_name": task_key,
-                            "mode": "url",
-                            "source_url": entry_url,
-                            "local_video": "",
-                            "local_audio": "",
-                            "user_keywords": ck.get("user_keywords", ""),
-                            **manifest_transcript_fields(item_out),
-                        },
-                    )
-                add_job_cost_to_totals(totals, cost)
-                processed_count += 1
-                done_urls.add(entry_url)
-                save_done_urls(checkpoint_path, done_urls)
+            if not items:
+                items = [{"url": media_url, "title": ""}]
+            if len(items) > 1:
+                print(f"检测到 B 站合集/多分P，共 {len(items)} 个条目，将逐个处理。")
         else:
-            if media_url in done_urls:
-                print(f"[skip] 已完成，跳过：{media_url}")
-                continue
-            parsed = urllib.parse.urlparse(media_url)
-            base_name = Path(parsed.path).stem or f"url_{idx}"
-            name = sanitize_name(base_name)
-            item_out = out_root / sanitize_name(f"{name}_{idx:02d}")
-            cost = process_single_source(
-                api_key=args.api_key,
-                media_url=media_url,
-                output_dir=item_out,
-                poll_interval=args.poll_interval,
-                timeout=args.timeout,
-                oss_resolve=False,
-                cancel_event=cancel_event,
-                pause_event=pause_event,
-                task_title=name,
-                **ck,
+            items = fetch_douyin_entry(
+                media_url, cancel_event=cancel_event, pause_event=pause_event
             )
+
+        for sub_idx, item in enumerate(items, start=1):
+            entry_url = normalize_entry_url(item.get("url") or media_url)
+            if entry_url in done_urls:
+                print(f"[skip] 已完成，跳过：{entry_url}")
+                continue
+
+            parsed = urllib.parse.urlparse(entry_url)
+            base_name = Path(parsed.path).stem or f"url_{idx}_{sub_idx}"
+            name = sanitize_name(base_name)
+            id_fallback = (
+                extract_bilibili_bvid(entry_url)
+                if platform == "bilibili"
+                else (extract_douyin_video_id(entry_url) or name)
+            )
+            display_name = (item.get("title") or "").strip()
+            if not display_name:
+                display_name = (
+                    fetch_ytdlp_title(entry_url, cancel_event=cancel_event, pause_event=pause_event)
+                    or ""
+                )
+            display_name = display_name.strip() or str(id_fallback)
+            item_out = out_root / sanitize_name(f"{display_name}_{sub_idx:02d}")
+            task_key = item_out.name
+            local_wav = url_tmp / f"{task_key}.wav"
+            local_video_path: Path | None = find_merged_source_video(item_out)
+            oss_url: str | None = None
+            plat_label = platform_label(platform)
+
+            try:
+                wav_ok = local_wav.exists() and local_wav.stat().st_size > 0
+                if wav_ok and local_video_path:
+                    print(f"[{task_key}] 复用已缓存音视频：wav={local_wav} video={local_video_path}")
+                elif local_video_path and not wav_ok:
+                    print(f"[{task_key}] 复用已下载视频并提取音频：{local_video_path}")
+                    extract_wav_for_asr(local_video_path, local_wav)
+                    print(f"[{task_key}] 已提取音频：{local_wav}")
+                elif wav_ok and not local_video_path:
+                    print(f"[{task_key}] 仅有历史 wav、缺少视频缓存，重新下载：{entry_url}")
+                    local_video_path = download_source_video(
+                        entry_url, platform, item_out, cancel_event, pause_event
+                    )
+                    extract_wav_for_asr(local_video_path, local_wav)
+                else:
+                    print(f"[{task_key}] 检测到{plat_label}链接，先下载视频并转音频：{entry_url}")
+                    local_video_path = download_source_video(
+                        entry_url, platform, item_out, cancel_event, pause_event
+                    )
+                    print(f"[{task_key}] 已下载视频：{local_video_path}")
+                    extract_wav_for_asr(local_video_path, local_wav)
+                    print(f"[{task_key}] 已提取音频：{local_wav}")
+                oss_url = upload_to_dashscope_tmp(args.api_key, local_wav)
+                print(f"[{task_key}] 已上传临时存储: {oss_url}")
+                cost = process_single_source(
+                    api_key=args.api_key,
+                    media_url=oss_url,
+                    output_dir=item_out,
+                    poll_interval=args.poll_interval,
+                    timeout=args.timeout,
+                    oss_resolve=True,
+                    cancel_event=cancel_event,
+                    pause_event=pause_event,
+                    task_title=display_name,
+                    **ck,
+                )
+            except Exception as exc:
+                msg = _format_download_error(exc, platform)
+                print(f"[{task_key}] 媒体下载/转码/上传失败：{msg}", file=sys.stderr)
+                if platform == "douyin":
+                    raise RuntimeError(
+                        f"[{task_key}] 抖音须先下载音视频再识别。请先修 Cookie：python tools/doctor.py\n{msg}"
+                    ) from exc
+                print(f"[{task_key}] 回退直链识别：{exc}")
+                cost = process_single_source(
+                    api_key=args.api_key,
+                    media_url=entry_url,
+                    output_dir=item_out,
+                    poll_interval=args.poll_interval,
+                    timeout=args.timeout,
+                    oss_resolve=False,
+                    cancel_event=cancel_event,
+                    pause_event=pause_event,
+                    task_title=display_name,
+                    **ck,
+                )
+                local_video_path = None
+                oss_url = None
+
             write_task_manifest(
                 item_out,
                 {
-                    "task_name": name,
-                    "mode": "url",
-                    "source_url": media_url,
-                    "local_video": "",
-                    "local_audio": "",
+                    "task_name": task_key,
+                    "mode": platform,
+                    "source_url": entry_url,
+                    "local_video": str(local_video_path.resolve()) if local_video_path else "",
+                    "local_audio": str(local_wav.resolve()) if oss_url else "",
                     "user_keywords": ck.get("user_keywords", ""),
+                    "post_asr_mode": ck.get("post_asr_mode", "correct"),
                     **manifest_transcript_fields(item_out),
                 },
             )
             add_job_cost_to_totals(totals, cost)
             processed_count += 1
-            done_urls.add(media_url)
+            done_urls.add(entry_url)
             save_done_urls(checkpoint_path, done_urls)
 
     if processed_count > 1:

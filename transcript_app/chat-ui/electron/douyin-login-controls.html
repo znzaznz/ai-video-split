@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>抖音登录</title>
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        padding: 10px 14px;
+        font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+        font-size: 13px;
+        background: #1a1a1a;
+        color: #e8e8e8;
+        user-select: none;
+      }
+      .hint {
+        margin: 0 0 10px;
+        line-height: 1.45;
+        color: #b0b0b0;
+      }
+      .actions {
+        display: flex;
+        gap: 10px;
+        justify-content: flex-end;
+      }
+      button {
+        padding: 8px 18px;
+        border-radius: 6px;
+        border: none;
+        font-size: 13px;
+        cursor: pointer;
+      }
+      .primary {
+        background: #fe2c55;
+        color: #fff;
+      }
+      .primary:hover {
+        background: #e0264b;
+      }
+      .secondary {
+        background: #333;
+        color: #e8e8e8;
+      }
+      .secondary:hover {
+        background: #444;
+      }
+    </style>
+  </head>
+  <body>
+    <p class="hint">
+      在上方登录抖音（扫码即可）。点「继续解析」会保存 Cookie 并<strong>自动关闭本窗口</strong>；下载由 yt-dlp 在后台完成，<strong>无需保持视频播放</strong>。
+    </p>
+    <div class="actions">
+      <button type="button" class="secondary" id="btn-cancel">取消</button>
+      <button type="button" class="primary" id="btn-continue">继续解析</button>
+    </div>
+    <script>
+      const { ipcRenderer } = require("electron");
+      document.getElementById("btn-continue").addEventListener("click", () => {
+        ipcRenderer.send("douyin-login:continue");
+      });
+      document.getElementById("btn-cancel").addEventListener("click", () => {
+        ipcRenderer.send("douyin-login:cancel");
+      });
+    </script>
+  </body>
+</html>

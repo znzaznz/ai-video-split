@@ -1,0 +1,63 @@
+{
+  "name": "video-to-word-transcript-chat",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "main": "dist-electron/main.cjs",
+  "scripts": {
+    "dev": "node scripts/run-vite-dev.mjs",
+    "dev:web": "vite --config vite.web.config.ts --host",
+    "build": "vite build",
+    "release": "vite build && electron-builder",
+    "build:renderer": "vite build",
+    "build:web": "vite build --config vite.web.config.ts",
+    "preview:web": "vite preview --config vite.web.config.ts --host"
+  },
+  "dependencies": {
+    "https-proxy-agent": "^7.0.6",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.1",
+    "@types/react": "^19.0.8",
+    "@types/react-dom": "^19.0.3",
+    "@vitejs/plugin-react": "^4.3.4",
+    "electron": "^34.0.0",
+    "electron-builder": "^25.1.8",
+    "typescript": "~5.7.3",
+    "vite": "^6.1.0",
+    "vite-plugin-electron": "^0.29.0"
+  },
+  "build": {
+    "appId": "com.video-to-word.transcript-chat",
+    "productName": "视频转写查证",
+    "directories": {
+      "output": "../electron-release"
+    },
+    "files": [
+      "dist/**/*",
+      "dist-electron/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "electron/douyin-login-controls.html",
+        "to": "electron/douyin-login-controls.html"
+      },
+      {
+        "from": "resources/app-icon.png",
+        "to": "app-icon.png"
+      }
+    ],
+    "win": {
+      "icon": "resources/app-icon.ico",
+      "target": [
+        "portable"
+      ],
+      "artifactName": "转写查证-${version}-portable.${ext}",
+      "signAndEditExecutable": false
+    }
+  }
+}

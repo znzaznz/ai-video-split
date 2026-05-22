@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import json
 import re
+import urllib.error
+import urllib.request
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from slice_logic import (
     DEFAULT_CHUNK_MINUTES,
@@ -48,9 +50,36 @@ def check_cancel(cancel_event: Any | None) -> None:
         raise PipelineCancelled("切片已取消。")
 
 
+TIME_RANGE_MODE = "按时间范围"
+TIME_RANGE_PIPELINE = "time_range"
+TIME_RANGE_PARSE_HINT = (
+    "请写明起止时间（可用自然语言），例如：七分钟到八分20秒、7:00-8:00、"
+    "00:07:00–00:08:00；可选「前后各多留约 5 秒」。"
+)
+TIME_RANGE_PARSE_HINT_NO_KEY = (
+    "未能识别起止时间。请写清从几分到几分（或 7:00-8:00），"
+    "或在 .env 配置 API Key 后可用自然语言由 AI 解析。"
+)
+
+_CN_DIGIT = {
+    "零": 0,
+    "〇": 0,
+    "一": 1,
+    "二": 2,
+    "两": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+}
+
+
 @dataclass
 class SliceRules:
-    pipeline: str = "single_pass"  # single_pass | chunked_fine | retrieve_coarse_fine
+    pipeline: str = "single_pass"  # single_pass | chunked_fine | retrieve_coarse_fine | time_range
     tier: str = "S"
     base_mode: str = DEFAULT_SLICE_LOGIC
     search_terms: list[str] = field(default_factory=list)
@@ -162,8 +191,8 @@ def build_default_rules(
         use_retrieval = mode_uses_retrieval(key)
         use_reduce = True
 
-    if key == "按时间范围":
-        pipeline = "single_pass" if tier == "S" else "chunked_fine"
+    if key == TIME_RANGE_MODE:
+        pipeline = TIME_RANGE_PIPELINE
         use_coarse = False
         use_retrieval = False
         use_reduce = False
@@ -173,7 +202,7 @@ def build_default_rules(
         use_reduce = True
 
     fine_extra = goal if goal else ""
-    if mode_prefers_merge(key):
+    if mode_prefers_merge(key) and key != TIME_RANGE_MODE:
         fine_extra = (fine_extra + " 同一主题尽量合并为完整段落，避免无故切碎。").strip()
 
     return SliceRules(
@@ -275,8 +304,10 @@ def describe_execution_plan(
     steps: list[str] = []
     if will_plan:
         steps.append("规划AI定规则")
-    if rules.base_mode == "按时间范围":
-        steps.append("解析时间范围")
+    if rules.base_mode == TIME_RANGE_MODE:
+        steps.append("解析时间范围并直裁")
+    if rules.pipeline == TIME_RANGE_PIPELINE:
+        steps.append("按起止时间直裁(无AI)")
     if rules.use_retrieval and rules.search_terms:
         steps.append(f"关键词检索({len(rules.search_terms)}词)")
     if rules.pipeline == "single_pass":
@@ -313,7 +344,7 @@ def should_run_planning_ai(
 ) -> bool:
     if skip_planning:
         return False
-    if logic_key == "按时间范围" and _parse_time_range_ms(slice_goal or ""):
+    if logic_key == TIME_RANGE_MODE:
         return False
     if tier == "S" and not _goal_complexity(slice_goal or "", logic_key):
         return False
@@ -322,31 +353,360 @@ def should_run_planning_ai(
     return _goal_complexity(slice_goal or "", logic_key)
 
 
-def _parse_time_range_ms(goal: str) -> tuple[int, int] | None:
-    """Parse HH:MM:SS–HH:MM:SS or similar from goal text."""
-    pat = re.compile(
-        r"(\d{1,2}:\d{2}:\d{2}(?:[.,]\d{1,3})?|\d{1,2}:\d{2}(?:[.,]\d{1,3})?)"
-        r"\s*[-–—~至到]\s*"
-        r"(\d{1,2}:\d{2}:\d{2}(?:[.,]\d{1,3})?|\d{1,2}:\d{2}(?:[.,]\d{1,3})?)"
+def _parse_cn_int(text: str) -> int | None:
+    t = (text or "").strip()
+    if not t:
+        return None
+    if t.isdigit():
+        return int(t)
+    if all(ch.isdigit() for ch in t):
+        return int(t)
+    total = 0
+    num = 0
+    for ch in t:
+        if ch in _CN_DIGIT and _CN_DIGIT[ch] < 10:
+            num = num * 10 + _CN_DIGIT[ch]
+        elif ch == "十":
+            total += (num or 1) * 10
+            num = 0
+        elif ch == "百":
+            total += (num or 1) * 100
+            num = 0
+        else:
+            return None
+    return total + num
+
+
+def _colon_ts_to_ms(ts: str) -> int:
+    ts = ts.replace(",", ".")
+    parts = ts.split(":")
+    if len(parts) == 2:
+        h = 0
+        mi, sec = parts
+    else:
+        h, mi, sec = parts
+    sec_parts = sec.split(".")
+    s = int(sec_parts[0])
+    frac = sec_parts[1] if len(sec_parts) > 1 else ""
+    ms = int(float("0." + frac) * 1000) if frac else 0
+    return (int(h) * 3600 + int(mi) * 60 + s) * 1000 + ms
+
+
+def _parse_duration_token_ms(token: str) -> int | None:
+    t = (token or "").strip()
+    if not t:
+        return None
+    colon = re.match(
+        r"^(\d{1,2}:\d{2}(?::\d{2})?(?:[.,]\d{1,3})?|\d{1,2}:\d{2}(?:[.,]\d{1,3})?)$",
+        t,
     )
-    m = pat.search(goal)
-    if not m:
+    if colon:
+        return _colon_ts_to_ms(t)
+    m = re.match(
+        r"^(\d+|[零一二两三四五六七八九十百]+)\s*分(?:钟)?(?:\s*(\d+|[零一二两三四五六七八九十]+)\s*秒)?$",
+        t,
+    )
+    if m:
+        minutes = _parse_cn_int(m.group(1))
+        if minutes is None:
+            return None
+        seconds = 0
+        if m.group(2):
+            sec_v = _parse_cn_int(m.group(2))
+            if sec_v is None:
+                return None
+            seconds = sec_v
+        return (minutes * 60 + seconds) * 1000
+    m2 = re.match(r"^(\d+|[零一二两三四五六七八九十百]+)\s*秒$", t)
+    if m2:
+        sec_v = _parse_cn_int(m2.group(1))
+        return (sec_v * 1000) if sec_v is not None else None
+    return None
+
+
+def _parse_time_range_ms(goal: str) -> tuple[int, int] | None:
+    """Parse start/end times from goal (colon, 分/秒, or Chinese)."""
+    text = (goal or "").strip()
+    if not text:
         return None
 
-    def to_ms(ts: str) -> int:
-        ts = ts.replace(",", ".")
-        parts = ts.split(":")
-        if len(parts) == 2:
-            h = 0
-            mi, sec = parts
-        else:
-            h, mi, sec = parts
-        sec_parts = sec.split(".")
-        s = int(sec_parts[0])
-        ms = int(float("0." + sec_parts[1]) * 1000) if len(sec_parts) > 1 else 0
-        return (int(h) * 3600 + int(mi) * 60 + s) * 1000 + ms
+    sep = r"\s*[-–—~至到]\s*"
+    colon_pat = re.compile(
+        r"(\d{1,2}:\d{2}:\d{2}(?:[.,]\d{1,3})?|\d{1,2}:\d{2}(?:[.,]\d{1,3})?)"
+        + sep
+        + r"(\d{1,2}:\d{2}:\d{2}(?:[.,]\d{1,3})?|\d{1,2}:\d{2}(?:[.,]\d{1,3})?)"
+    )
+    m = colon_pat.search(text)
+    if m:
+        return _colon_ts_to_ms(m.group(1)), _colon_ts_to_ms(m.group(2))
 
-    return to_ms(m.group(1)), to_ms(m.group(2))
+    dur_pat = re.compile(
+        r"((?:\d+|[零一二两三四五六七八九十百]+)\s*分(?:钟)?(?:\s*(?:\d+|[零一二两三四五六七八九十]+)\s*秒)?|"
+        r"\d{1,2}:\d{2}(?::\d{2})?)"
+        + sep
+        + r"((?:\d+|[零一二两三四五六七八九十百]+)\s*分(?:钟)?(?:\s*(?:\d+|[零一二两三四五六七八九十]+)\s*秒)?|"
+        r"\d{1,2}:\d{2}(?::\d{2})?)"
+    )
+    m = dur_pat.search(text)
+    if m:
+        start = _parse_duration_token_ms(m.group(1))
+        end = _parse_duration_token_ms(m.group(2))
+        if start is not None and end is not None and end > start:
+            return start, end
+
+    return None
+
+
+def _parse_pad_ms(goal: str, default: int = 0) -> int:
+    text = (goal or "").strip()
+    if not text:
+        return default
+    m = re.search(r"前后[^。\n]{0,24}?(\d+)\s*秒", text)
+    if m:
+        try:
+            return max(0, int(m.group(1)) * 1000)
+        except ValueError:
+            pass
+    m2 = re.search(r"各多留约?\s*(\d+)\s*秒", text)
+    if m2:
+        try:
+            return max(0, int(m2.group(1)) * 1000)
+        except ValueError:
+            pass
+    return default
+
+
+def parse_time_range_with_pad(goal: str, default_pad_ms: int = 0) -> tuple[int, int, int] | None:
+    tr = _parse_time_range_ms(goal)
+    if not tr:
+        return None
+    return tr[0], tr[1], _parse_pad_ms(goal, default_pad_ms)
+
+
+def _request_json_chat(
+    url: str,
+    headers: dict[str, str],
+    body: dict[str, Any],
+    timeout: int = 60,
+) -> dict[str, Any]:
+    data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(url=url, method="POST", headers=headers, data=data)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            text = resp.read().decode("utf-8")
+            return json.loads(text) if text.strip() else {}
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"HTTP {exc.code} {url}\n{detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"请求失败: {url}\n{exc}") from exc
+
+
+def _ms_from_llm_time_value(val: Any) -> int | None:
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        v = int(val)
+        if v > 100_000:
+            return v
+        return v * 1000
+    s = str(val).strip()
+    if not s:
+        return None
+    if s.isdigit():
+        v = int(s)
+        return v if v > 100_000 else v * 1000
+    token_ms = _parse_duration_token_ms(s)
+    if token_ms is not None:
+        return token_ms
+    if re.match(r"^\d{1,2}:\d{2}(:\d{2})?$", s):
+        return _colon_ts_to_ms(s)
+    return None
+
+
+def _time_range_from_llm_payload(payload: dict[str, Any]) -> tuple[int, int] | None:
+    start_ms = payload.get("start_ms")
+    end_ms = payload.get("end_ms")
+    if start_ms is not None and end_ms is not None:
+        s = _ms_from_llm_time_value(start_ms)
+        e = _ms_from_llm_time_value(end_ms)
+        if s is not None and e is not None and e > s:
+            return s, e
+    sh = payload.get("start_hms") or payload.get("start")
+    eh = payload.get("end_hms") or payload.get("end")
+    if sh is not None and eh is not None:
+        s = _ms_from_llm_time_value(sh)
+        e = _ms_from_llm_time_value(eh)
+        if s is not None and e is not None and e > s:
+            return s, e
+    return None
+
+
+def _validate_time_range_ms(
+    start_ms: int, end_ms: int, duration_ms: int | None
+) -> bool:
+    if end_ms <= start_ms or start_ms < 0:
+        return False
+    if duration_ms is not None and duration_ms > 0:
+        if start_ms >= duration_ms:
+            return False
+        if end_ms > duration_ms:
+            end_ms = duration_ms
+        if end_ms <= start_ms:
+            return False
+    return True
+
+
+def parse_time_range_via_llm(
+    goal: str,
+    api_key: str,
+    duration_ms: int | None = None,
+    *,
+    request_json_fn: Callable[..., dict[str, Any]] | None = None,
+) -> tuple[int, int] | None:
+    key = (api_key or "").strip()
+    if not key.startswith("sk-"):
+        return None
+    text = (goal or "").strip()
+    if not text:
+        return None
+
+    dur_hint = "未知"
+    if duration_ms is not None and duration_ms > 0:
+        dur_hint = format_ms_hms(duration_ms)
+
+    prompt = (
+        "你是视频裁剪时间解析助手。用户想用「按时间范围」从一整段视频里裁出一段。\n"
+        f"视频总时长约：{dur_hint}\n"
+        f"用户描述：{text}\n\n"
+        "请只提取起止时间，输出一个 JSON 对象（不要 markdown），字段任选其一：\n"
+        '- start_ms、end_ms（整数毫秒），或\n'
+        '- start_hms、end_hms（如 "07:00"、"00:07:00"）\n'
+        "可选 pad_seconds（整数，前后各多留秒数；用户未提则省略）。\n"
+        "若用户未给出任何起止时间，输出 {\"error\":\"no_range\"}。\n"
+        "不要编造用户未提到的时间。"
+    )
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    body: dict[str, Any] = {
+        "model": MODEL_PLAN,
+        "messages": [
+            {"role": "system", "content": "只输出合法 JSON 对象。"},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.1,
+        "response_format": {"type": "json_object"},
+    }
+    try:
+        if request_json_fn is not None:
+            data = request_json_fn(CHAT_URL, "POST", headers, body)
+        else:
+            data = _request_json_chat(CHAT_URL, headers, body)
+    except RuntimeError:
+        body.pop("response_format", None)
+        try:
+            if request_json_fn is not None:
+                data = request_json_fn(CHAT_URL, "POST", headers, body)
+            else:
+                data = _request_json_chat(CHAT_URL, headers, body)
+        except RuntimeError:
+            return None
+
+    content = (
+        ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+    ).strip()
+    if not content:
+        return None
+    try:
+        parsed = _parse_json_object(content)
+    except Exception:
+        return None
+    if parsed.get("error"):
+        return None
+    tr = _time_range_from_llm_payload(parsed)
+    if not tr:
+        return None
+    start_ms, end_ms = tr
+    if duration_ms is not None and duration_ms > 0 and end_ms > duration_ms:
+        end_ms = duration_ms
+    if not _validate_time_range_ms(start_ms, end_ms, duration_ms):
+        return None
+    return start_ms, end_ms
+
+
+def resolve_time_range_with_pad(
+    goal: str,
+    *,
+    api_key: str = "",
+    duration_ms: int | None = None,
+    default_pad_ms: int = 0,
+    request_json_fn: Callable[..., dict[str, Any]] | None = None,
+) -> tuple[int, int, int, str] | None:
+    """返回 (start_ms, end_ms, pad_ms, source)，source 为 regex 或 llm。"""
+    parsed = parse_time_range_with_pad(goal, default_pad_ms)
+    if parsed:
+        start_ms, end_ms, pad_ms = parsed
+        if _validate_time_range_ms(start_ms, end_ms, duration_ms):
+            return start_ms, end_ms, pad_ms, "regex"
+
+    llm_tr = parse_time_range_via_llm(
+        goal, api_key, duration_ms, request_json_fn=request_json_fn
+    )
+    if not llm_tr:
+        return None
+    start_ms, end_ms = llm_tr
+    pad_ms = _parse_pad_ms(goal, default_pad_ms)
+    return start_ms, end_ms, pad_ms, "llm"
+
+
+def format_ms_hms(ms: int) -> str:
+    ms = max(0, int(ms))
+    total_sec = ms // 1000
+    h = total_sec // 3600
+    mi = (total_sec % 3600) // 60
+    sec = total_sec % 60
+    if h > 0:
+        return f"{h:02d}:{mi:02d}:{sec:02d}"
+    return f"{mi:02d}:{sec:02d}"
+
+
+def format_time_range_preview(
+    goal: str,
+    video_duration_ms: int | None = None,
+    *,
+    api_key: str = "",
+    request_json_fn: Callable[..., dict[str, Any]] | None = None,
+) -> tuple[str, str]:
+    """返回 (preview_text, status)：status 为 ok | fail | need_key。"""
+    resolved = resolve_time_range_with_pad(
+        goal,
+        api_key=api_key,
+        duration_ms=video_duration_ms,
+        request_json_fn=request_json_fn,
+    )
+    if not resolved:
+        if (api_key or "").strip().startswith("sk-"):
+            return "", "fail"
+        if parse_time_range_with_pad(goal):
+            return "", "fail"
+        return "", "need_key" if (goal or "").strip() else "fail"
+
+    start_ms, end_ms, pad_ms, source = resolved
+    lo = max(0, start_ms - pad_ms)
+    hi = end_ms + pad_ms
+    if video_duration_ms is not None and video_duration_ms > 0:
+        hi = min(hi, video_duration_ms)
+    dur_s = max(0, hi - lo) / 1000.0
+    tag = "（AI 解析）" if source == "llm" else ""
+    if pad_ms > 0:
+        detail = (
+            f"将裁剪 {format_ms_hms(lo)}–{format_ms_hms(hi)}（核心 {format_ms_hms(start_ms)}–"
+            f"{format_ms_hms(end_ms)}，前后各 {pad_ms // 1000}s，约 {dur_s:.0f}s）{tag}"
+        )
+    else:
+        detail = (
+            f"将裁剪 {format_ms_hms(start_ms)}–{format_ms_hms(end_ms)}（约 {dur_s:.0f}s）{tag}"
+        )
+    return detail, "ok"
 
 
 def _parse_json_object(content: str) -> dict[str, Any]:
@@ -542,12 +902,15 @@ def clips_from_time_range(
     sentences: list[dict[str, Any]],
     start_ms: int,
     end_ms: int,
-    pad_ms: int = 5000,
+    pad_ms: int = 0,
     title: str = "时间范围",
+    video_duration_ms: int | None = None,
 ) -> list[dict[str, Any]]:
     lo = max(0, start_ms - pad_ms)
     hi = end_ms + pad_ms
-    if sentences:
+    if video_duration_ms is not None and video_duration_ms > 0:
+        hi = min(hi, video_duration_ms)
+    elif sentences:
         hi = min(hi, max(int(s["end_ms"]) for s in sentences))
     if hi <= lo:
         return []

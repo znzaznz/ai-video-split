@@ -1,15 +1,31 @@
 ---
-description: Checklist when authoring Cursor plans for this repo (migration / exe / reuse)
+description: Checklist when authoring Cursor plans (Substack phased Build + this repo)
 alwaysApply: false
 ---
 
 # Plan 生成检查项（本仓库）
 
-制定 **Plan 模式** 计划时，除任务本身外应写明：
+制定 **Plan 模式** 计划时，流程对齐 [Engincan Veske — Plan Mode 实战](https://engincanveske.substack.com/p/how-i-use-cursor-plan-mode-for-real)，并叠加本仓库约束。模板：`.cursor/plans/_TEMPLATE.md`。
 
-1. **少增文件**：优先扩展现有模块；能删则删重复 helper；新能力写入 `transcript_pipeline.py` / `transcript_correct.py` 等已有文件。
-2. **迁移里程碑**：每阶段结束 `py_compile` → 相关 `build_*_exe.ps1`（清旧 `build/`、`dist/`、旧 exe）→ **启动新生成 exe** 冒烟测通再继续。
-3. **双 exe**：若改动共享转写管线，计划收尾须含 `transcript_app/build_transcript_exe.ps1` 与根目录 `build_exe.ps1`（视改动范围）。
+## Plan 模式流程
+
+1. **Save to Workspace**：计划落盘 `.cursor/plans/YYYY-MM-DD-xxx.md`，不要只留在用户目录。
+2. **先核心后增强**：阶段 1 只写 MVP；nice-to-have 放阶段 2。
+3. **人工改 plan 再 Build**：删多余步骤、补 `gui.py`/双 exe/样例 `runs/` 路径。
+4. **分阶段 Build**：不要一次 Build 全部 TODO；每组 Build 后跑该阶段验收命令。
+5. **关键决策回写**：实现偏离时在 plan 追加「关键决策」表，保持 plan 与代码一致。
+6. **架构疑问用 Ask**：新开 Ask 会话调研，结论写回 plan，避免单会话 context 爆掉。
+
+## 本仓库技术项（写入 plan 步骤/验收）
+
+1. **少增文件**：优先扩展现有模块；新能力写入 `transcript_pipeline.py` / `transcript_correct.py` 等已有文件。
+2. **每阶段里程碑**：阶段结束 → `scripts/verify.ps1` → 按需 smoke → 相关 `build_*_exe.ps1`（清旧 `build/`、`dist/`、旧 exe）→ **启动新生成 exe** 再继续。
+3. **双 exe**：改动共享转写管线时，在 plan 标明需 `transcript_app/build_transcript_exe.ps1` 与/或根目录 `build_exe.ps1`。
 4. **费用与日志**：转写/纠错/切片费用分项；长任务需进度日志，避免「假死」。
 5. **输出兼容**：`runs/<task>/result.json` 与切片机解析页互通；约定是否复制 `source.mp4`。
-6. **不在计划文件里改**：实施时不要编辑 `.plan.md` 本身。
+6. **每条 TODO 带验证**：禁止只写「实现功能」；须写命令、输出路径或 GUI 行为（见模板阶段验收节）。
+
+## 与 Agent / ship-workflow
+
+- 阶段验收与文末 **交付勾选** 由 Agent 执行，见 [execute-dont-preach.mdc](execute-dont-preach.mdc)、[ship-workflow.mdc](ship-workflow.mdc)。
+- **不自动 commit/push**；仅用户明确要求时提交。

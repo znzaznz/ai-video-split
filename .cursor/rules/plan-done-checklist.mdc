@@ -13,10 +13,13 @@ alwaysApply: true
 
 ## Agent 必做（与勾选对应）
 
-1. **联动**：改 `slice_logic` / `slice_strategy` / `auto_clip` / `transcript_correct` 等 → 检查 `gui.py`、`main.py`；删符号 → 全仓库 grep。
-2. **验收**：`scripts/verify.ps1`（失败则停止，不 commit、不宣称完成）。
-3. **打包**：若动了打进 exe 的源码 → `build_exe.ps1`（见 `exe-auto-build-after-changes.mdc`）；用户明确说不要 exe 可跳过。
-4. **Git**：`git status` + staged 列表；禁止 `git add -A`；无 `.env`/exe/`runs/` 等；仅用户要求时 commit；不自动 push。
+1. **分阶段 Build**：按 plan「阶段 1 → 验收 → 阶段 2」执行；**禁止**一次 Build 全部 TODO（见 [plan-generation-checklist.mdc](plan-generation-checklist.mdc)）。
+2. **联动**：改切片/转写管线 → 检查 `gui.py`、`transcript_gui.py`、`transcript_cli.py` 等；删符号 → 全仓库 grep。
+3. **验收**：每阶段结束 + 最终交付前跑 `scripts/verify.ps1`（失败则停止，不 commit、不宣称完成）。
+4. **动手冒烟**：按 [execute-dont-preach.mdc](execute-dont-preach.mdc) **Agent 亲自跑** smoke/E2E，禁止只写教程。
+5. **打包**：若动了打进 exe 的源码 → `build_exe.ps1` / `transcript_app/build_transcript_exe.ps1`；用户明确说不要 exe 可跳过。
+6. **Git**：`git status` + staged 列表；禁止 `git add -A`；无 `.env`/exe/`runs/` 等；仅用户要求时 commit；不自动 push。
+7. **关键决策**：实现偏离时在 `.cursor/plans/*.md` 追加「关键决策」行，勿只留在聊天里。
 
 ## 完整勾选列表
 

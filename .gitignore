@@ -24,3 +24,9 @@ transcript_usage_stats.json
 .cursor/*
 !.cursor/rules/
 !.cursor/plans/
+
+# Node / Electron（chat-ui）
+node_modules/
+transcript_app/chat-ui/dist/
+transcript_app/chat-ui/dist-electron/
+transcript_app/electron-release/

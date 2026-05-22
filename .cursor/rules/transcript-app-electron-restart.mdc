@@ -1,0 +1,32 @@
+---
+description: transcript-app（Electron）改完主进程/preload 后必须重启 dev
+globs: transcript_app/chat-ui/**/*
+alwaysApply: false
+---
+
+# transcript-app：Electron 改完要重启
+
+[`transcript_app/chat-ui`](c:\code\video-to-word\transcript_app\chat-ui) 是 **Electron + Vite** 项目。收尾时按改动类型处理：
+
+## 必须重启 `npm run dev`
+
+改了以下任一类，**热更新不可靠或无效**，Agent 应**先结束旧 dev 进程再启动**，并在回复里提醒用户已重启或请重启：
+
+- [`electron/main.ts`](c:\code\video-to-word\transcript_app\chat-ui\electron\main.ts)（IPC、`BrowserWindow`、Python 子进程）
+- [`electron/preload.ts`](c:\code\video-to-word\transcript_app\chat-ui\electron\preload.ts)（`contextBridge` / `bbChat` API）
+- 构建产物逻辑：`dist-electron/*`（由上述源文件编译）
+
+```powershell
+# 在 transcript_app/chat-ui 目录
+# 先关掉正在跑的「视频转写查证」窗口与旧 npm run dev，再：
+npm run dev
+```
+
+## 通常不必重启（仅改渲染进程）
+
+仅改 [`src/**`](c:\code\video-to-word\transcript_app\chat-ui\src)（React/CSS）时，Vite HMR 多数情况够用。若 UI 行为与代码不一致，仍建议全量重启 dev。
+
+## Agent 收尾
+
+- 动过 **main / preload / IPC** 后：默认帮用户重启 dev（或明确写出「请关掉旧窗口后重新 `npm run dev`」），**不要**假设 HMR 已生效。
+- 仅文档或未改 electron 源码：可不重启。

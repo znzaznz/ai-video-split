@@ -696,7 +696,7 @@ def run_post_asr_correction(
                 api_key, corrected, glossary, task_title
             )
             llm_cost += correct_cost
-            print(f"纠错：LLM 润色完成，估算费用约 ¥{correct_cost:.6f}", flush=True)
+            print(f"纠错：LLM 润色完成，估算费用约 {correct_cost:.6f} 元", flush=True)
         except Exception as exc:
             print(f"纠错：LLM 失败（保留规则结果）：{exc}", flush=True)
     elif enable_llm:

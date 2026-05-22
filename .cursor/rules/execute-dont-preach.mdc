@@ -1,0 +1,33 @@
+---
+description: 能动手就别光说——收尾前 Agent 必须亲自跑命令验证，禁止只贴教程
+alwaysApply: true
+---
+
+# 先动手，再汇报（与全局 skill execute-dont-preach 一致）
+
+## 硬规则
+
+1. **可执行就先执行**：脚本、路径、依赖已知时，**默认在对话里跑完**，不要等用户第二遍说「动手吧」。
+2. **说明要短**：2～5 句 + 输出路径/关键日志；不要长篇「你可以…」「建议…」却不跑命令。
+3. **失败再解释**：命令报错再给原因和已尝试修复，不要事前堆预案。
+4. **Plan 模式例外**：用户处于 Plan 模式或明确「先别动」时，只调研不执行。
+
+## 宣称「做完了」之前（本仓库必做）
+
+在 [ship-workflow.mdc](ship-workflow.mdc) 的 `verify.ps1` **之后**、打包/commit **之前**，Agent **必须**再跑至少一项（按改动选）：
+
+| 改动类型 | 必跑（示例） |
+|----------|----------------|
+| 任意 Python 功能 | `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify.ps1`（ship-workflow 已要求） |
+| 转写 / transcript 线 | `python scripts/smoke_test_transcript.py`（无 Key 也可测抽链；有 Key 测润色） |
+| 抖音 / yt-dlp | `python tools/doctor.py` 或 `python transcript_cli.py --doctor` |
+| 改了 `transcript_app/chat-ui` | `cd transcript_app/chat-ui` → `npm run build`（不必长期 `npm run dev`） |
+| 打进 exe 的 GUI/管线 | 对应 `build_exe.ps1` / `transcript_app/build_transcript_exe.ps1` 后**启动新 exe** 试一条主路径 |
+
+- 未跑：**不得**宣称交付完成，回复里写明「还差哪条命令」。
+- 汇报须含：**实际命令**、**退出码/关键输出**、**产物路径**（如 `runs/.../result.json`）。
+
+## 禁止
+
+- 只给用户命令列表，自己零执行（除非用户明确要教程或环境不可跑）。
+- 把 Plan 里的「手动验收」理解成**只让用户做**；Agent 能跑的 smoke/E2E **自己跑**。

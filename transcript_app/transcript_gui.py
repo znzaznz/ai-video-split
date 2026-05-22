@@ -57,6 +57,10 @@ class App:
         self.poll_var = tk.StringVar(value=env.get("POLL_INTERVAL", "2"))
         self.timeout_var = tk.StringVar(value=env.get("TIMEOUT", "900"))
         self.keywords_var = tk.StringVar(value=env.get("TRANSCRIPT_KEYWORDS", ""))
+        default_mode = env.get("TRANSCRIPT_POST_ASR_MODE", "correct").strip().lower()
+        if default_mode not in ("correct", "polish", "none"):
+            default_mode = "correct"
+        self.post_asr_mode_var = tk.StringVar(value=default_mode)
         self.llm_correct_var = tk.BooleanVar(value=env.get("TRANSCRIPT_LLM_CORRECT", "1") != "0")
 
         self.local_files: list[str] = []
@@ -124,9 +128,17 @@ class App:
         ttk.Entry(frm, textvariable=self.keywords_var, width=70).grid(
             row=3, column=1, columnspan=3, sticky="ew", pady=(4, 0)
         )
-        ttk.Checkbutton(frm, text="转写后 AI 纠错", variable=self.llm_correct_var).grid(
-            row=3, column=4, sticky="w", pady=(4, 0)
-        )
+        post_frm = ttk.Frame(frm)
+        post_frm.grid(row=3, column=4, sticky="w", pady=(4, 0))
+        ttk.Label(post_frm, text="转写后:").pack(side=tk.LEFT)
+        for label, val in (("纠错", "correct"), ("润色", "polish"), ("仅转写", "none")):
+            ttk.Radiobutton(
+                post_frm,
+                text=label,
+                value=val,
+                variable=self.post_asr_mode_var,
+                command=self._sync_post_asr_mode,
+            ).pack(side=tk.LEFT, padx=(4, 0))
 
         self.local_frame = ttk.LabelFrame(frm, text="本地视频输入")
         self.local_frame.grid(row=4, column=0, columnspan=5, sticky="nsew", pady=(8, 6))
@@ -136,8 +148,15 @@ class App:
         self.local_list = tk.Listbox(self.local_frame, height=5)
         self.local_list.pack(fill=tk.BOTH, expand=True)
 
-        self.url_frame = ttk.LabelFrame(frm, text="链接输入（每行一个URL）")
+        self.url_frame = ttk.LabelFrame(
+            frm, text="链接输入（每行一个 URL 或抖音/B 站分享文案）"
+        )
         self.url_frame.grid(row=5, column=0, columnspan=5, sticky="nsew", pady=(8, 6))
+        ttk.Label(
+            self.url_frame,
+            text="支持粘贴整段分享文案，自动抽出 B 站/抖音链接",
+            foreground="#555",
+        ).pack(anchor="w")
         self.url_text = scrolledtext.ScrolledText(self.url_frame, height=5)
         self.url_text.pack(fill=tk.BOTH, expand=True)
 
@@ -150,6 +169,10 @@ class App:
         self.cancel_btn = ttk.Button(btns, text="取消", command=self._cancel_run, state=tk.DISABLED)
         self.cancel_btn.pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(btns, text="清空日志", command=self._clear_log).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(btns, text="转写查证(Electron)", command=self._open_chat_ui).pack(
+            side=tk.LEFT, padx=(8, 0)
+        )
+        ttk.Button(btns, text="环境预检", command=self._run_doctor).pack(side=tk.LEFT, padx=(4, 0))
 
         log_frame = ttk.LabelFrame(frm, text="运行日志")
         log_frame.grid(row=7, column=0, columnspan=5, sticky="nsew", pady=(6, 0))
@@ -200,6 +223,49 @@ class App:
             self.local_list.delete(0, tk.END)
             for f in self.local_files:
                 self.local_list.insert(tk.END, f)
+
+    def _sync_post_asr_mode(self) -> None:
+        mode = self.post_asr_mode_var.get()
+        if mode == "correct":
+            self.llm_correct_var.set(True)
+        elif mode == "none":
+            self.llm_correct_var.set(False)
+
+    def _open_chat_ui(self) -> None:
+        root = tp.get_runtime_base_dir()
+        chat_dir = root / "transcript_app" / "chat-ui"
+        if not (chat_dir / "package.json").is_file():
+            messagebox.showerror("错误", f"未找到 chat-ui：{chat_dir}")
+            return
+        messagebox.showinfo(
+            "转写查证",
+            "请在终端执行：\n\n"
+            f"cd {chat_dir}\n"
+            "npm install\n"
+            "npm run dev\n\n"
+            "需配置 .env 中 GEMINI_API_KEY（对话）与 DASHSCOPE_API_KEY（转写）。",
+        )
+
+    def _run_doctor(self) -> None:
+        root = tp.get_runtime_base_dir()
+        doctor_py = root / "tools" / "doctor.py"
+        if not doctor_py.is_file():
+            messagebox.showerror("错误", f"未找到 {doctor_py}")
+            return
+        import subprocess
+
+        try:
+            proc = subprocess.run(
+                [sys.executable, str(doctor_py)],
+                cwd=str(root),
+                capture_output=True,
+                text=True,
+                **tp.get_subprocess_window_kwargs(),
+            )
+            out = (proc.stdout or "") + "\n" + (proc.stderr or "")
+            self._log(out.strip() or f"doctor 退出码 {proc.returncode}")
+        except Exception as exc:
+            messagebox.showerror("预检失败", str(exc))
 
     def _refresh_mode(self) -> None:
         if self.mode_var.get() == "local":
@@ -283,13 +349,15 @@ class App:
     def _run_job(self, items: list[str]) -> None:
         try:
             mode = self.mode_var.get()
+            post_mode = self.post_asr_mode_var.get().strip().lower()
             args = argparse_namespace(
                 api_key=self.api_key_var.get().strip(),
                 out_dir=Path(self.out_dir_var.get().strip() or "runs"),
                 poll_interval=int(self.poll_var.get().strip() or "2"),
                 timeout=int(self.timeout_var.get().strip() or "900"),
                 user_keywords=self.keywords_var.get().strip(),
-                no_llm_correct=not bool(self.llm_correct_var.get()),
+                no_llm_correct=post_mode == "none",
+                post_asr_mode=post_mode,
                 mode=mode,
                 videos=items if mode == "local" else None,
                 urls=items if mode == "url" else None,

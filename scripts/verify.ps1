@@ -6,11 +6,16 @@ Set-Location $root
 $modules = @(
     "gui.py",
     "main.py",
+    "transcript_pipeline.py",
+    "transcript_cli.py",
+    "transcript_polish.py",
+    "video_platform.py",
     "auto_clip_from_transcript.py",
     "slice_logic.py",
     "slice_strategy.py",
     "video_to_text_paraformer.py",
-    "transcript_correct.py"
+    "transcript_correct.py",
+    "transcript_app/transcript_gui.py"
 )
 
 Write-Host "py_compile..."
